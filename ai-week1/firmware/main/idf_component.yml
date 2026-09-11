@@ -1,0 +1,6 @@
+# main 组件的依赖声明（ESP-IDF 组件管理器）
+# 第一次 build 时 idf.py 会据此自动从组件注册表拉取 esp32-camera 到 managed_components/。
+# 也可手动执行：idf.py add-dependency espressif/esp32-camera
+dependencies:
+  espressif/esp32-camera:
+    version: "*"

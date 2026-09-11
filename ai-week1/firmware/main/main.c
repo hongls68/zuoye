@@ -35,6 +35,7 @@
 
 #include "app_config.h"
 #include "qma7981.h"
+#include "camera.h"
 
 static const char *TAG = "app";
 

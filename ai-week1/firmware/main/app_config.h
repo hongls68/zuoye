@@ -108,7 +108,7 @@
  * 板子脱机（充电宝供电）时，只要 Wi-Fi 已配好，抓帧传图与加速度上报都会照常进行，
  * 与是否插电脑 USB 无关。
  */
-#define CAMERA_ENABLE           0       /* 1=启用摄像头；0=仅保留加速度计（恢复原状）*/
+#define CAMERA_ENABLE           1       /* 1=启用摄像头；0=仅保留加速度计（恢复原状）*/
 #define CAMERA_PERIOD_MS        2000    /* 摄像头抓帧并上传周期（实时性与带宽平衡）*/
 #define CAMERA_JPEG_QUALITY     12      /* 1=最佳 ~ 63=最差；越小越清晰体积越大 */
 /* 分辨率在 firmware/main/camera.c 顶部用 FRAMESIZE_* 指定（改那里即可）：
