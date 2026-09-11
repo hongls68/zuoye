@@ -1,0 +1,36 @@
+# sdkconfig.defaults —— ESP32-S3-EYE 板级默认配置
+# 用 `idf.py set-target esp32s3` 后，这些配置会自动合并进 sdkconfig。
+
+# 【关键】控制台走 USB Serial/JTAG，也就是你看到的 COM4。
+# 这块板没有独立的 USB 转 UART 芯片，若不设这一项，串口监视器将看不到任何日志。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 板载 8 MB flash（ESP32-S3-WROOM-1-N8R8），按实际硬件设置
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# 主任务栈增大到 8 KB：app_main 里同时用到 cJSON 组装、HTTP 上传、SNTP，
+# 默认的 3.5 KB 偏紧，增大可避免栈溢出导致的莫名重启。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# 使用 -O2 而非默认的 -Og 优化等级。
+# 原因：ESP-IDF v5.5.5 + GCC 14.2.0 在 -Og 模式下编译 esp_lcd/rgb/esp_lcd_panel_rgb.c
+# 会触发 GCC 自身的 RTL pass bug（内部段错误）。该驱动仅用于 RGB LCD 屏幕，
+# ESP32-S3-EYE 板载 SPI 小屏（不需要 RGB 驱动），但 IDF 默认仍会编译它。
+# 切到 -O2 后该文件可正常编译，不影响功能。
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# 本固件需要摄像头时，必须开启 PSRAM 作为帧缓冲；ESP32-S3-EYE(N8R8) 板载 8MB PSRAM。
+CONFIG_SPIRAM=y
+# ESP32-S3-EYE(N8R8) 板载 Octal(8线) PSRAM，必须选 OCT 模式；
+# 误选 QUAD 会在启动时报 "wrong PSRAM line mode" 并 abort。
+CONFIG_SPIRAM_MODE_OCT=y
+
+# 让 SCCB 走硬件 I2C（与板载 QMA7981 共用 I2C_NUM_0 / GPIO4-5）。
+# 否则 esp32-camera 默认用软件 bit-bang SCCB，初始化时重配 GPIO4/5 为普通 GPIO，
+# 覆盖 QMA7981 的硬件 I2C 配置，导致加速度计后续读取失败。
+CONFIG_CAMERA_SCCB_USE_I2C=y
+
+# 应用体积变大（esp32-camera 较大），原默认 1MB app 分区装不下，
+# 改用自定义分区表（factory 3MB），分区定义见 partitions.csv。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

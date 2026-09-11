@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>开发板传感器数据看板 · AI交互课第1周</title>
+<style>
+  :root {
+    --bg: #0f172a; --card: #1e293b; --line: #334155;
+    --txt: #e2e8f0; --dim: #94a3b8; --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--txt);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px;
+  }
+  .card .label { color: var(--dim); font-size: 12px; margin-bottom: 8px; }
+  .card .value { font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card .value small { font-size: 14px; color: var(--dim); font-weight: 400; }
+  .card .raw { margin-top: 6px; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #status {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border-radius: 999px; font-size: 13px;
+    background: var(--card); border: 1px solid var(--line);
+  }
+  #status .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+  #status.ok   .dot { background: var(--ok); }
+  #status.stale .dot { background: var(--warn); }
+  #status.err  .dot { background: var(--err); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+  select, button {
+    background: var(--card); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+  table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 8px 10px; text-align: left; }
+  th { color: var(--dim); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .note { color: var(--dim); font-size: 12px; margin-top: 12px; }
+  .cam { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  .cam .label { color: var(--dim); font-size: 12px; margin-bottom: 8px; }
+  .cam img { width: 100%; max-width: 520px; border-radius: 8px; border: 1px solid var(--line); background: #000; display: block; }
+  .cam .camnote { color: var(--dim); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>开发板传感器数据看板</h1>
+  <div class="sub">AI交互课 第1周 · ESP32-S3-EYE 板载加速度计（QMA7981）实时数据</div>
+
+  <div class="toolbar">
+    <span id="status"><span class="dot"></span><span id="statusText">连接中…</span></span>
+    <label>设备：
+      <select id="deviceSelect"><option value="">（尚未有设备上报）</option></select>
+    </label>
+    <button id="pauseBtn">暂停刷新</button>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">加速度 ax</div><div class="value" id="ax">--</div><div class="raw" id="rawX">raw: --</div></div>
+    <div class="card"><div class="label">加速度 ay</div><div class="value" id="ay">--</div><div class="raw" id="rawY">raw: --</div></div>
+    <div class="card"><div class="label">加速度 az</div><div class="value" id="az">--</div><div class="raw" id="rawZ">raw: --</div></div>
+    <div class="card"><div class="label">设备编号</div><div class="value" id="dev" style="font-size:20px">--</div></div>
+    <div class="card"><div class="label">板端采集时间</div><div class="value" id="tsDev" style="font-size:16px">--</div></div>
+    <div class="card"><div class="label">服务器入库时间</div><div class="value" id="tsSrv" style="font-size:16px">--</div></div>
+  </div>
+
+  <table>
+    <thead><tr><th>#</th><th>设备</th><th>传感器</th><th>ax</th><th>ay</th><th>az</th><th>原始ADC (x/y/z)</th><th>单位</th><th>板端时间</th><th>入库时间</th></tr></thead>
+    <tbody id="historyBody"><tr><td colspan="10" style="color:var(--dim)">等待数据…</td></tr></tbody>
+  </table>
+
+  <section class="cam">
+    <div class="label">实时摄像头 · 板载 OV2640（充电宝供电脱机也能无线传图到电脑）</div>
+    <img id="cam" alt="等待图像…">
+    <div class="camnote" id="camNote">等待开发板上传第一帧…</div>
+  </section>
+
+  <div class="note">说明：本页数值全部来自服务器查询接口 /api/latest 与 /api/history，不含任何写死的演示数据。停止采集后，页面将保留最后一条记录的时间并提示"数据未更新"。摄像头画面来自 /api/frame/latest，开发板停止上传后定格在最后一帧。</div>
+
+<script>
+(function () {
+  var POLL_MS = 1000;
+  var STALE_MS = 10000;   // 超过 10 秒没有新数据 => 判定"未更新"
+  var paused = false;
+  var el = function (id) { return document.getElementById(id); };
+  var statusBox = el('status'), statusText = el('statusText');
+
+  function setStatus(cls, text) {
+    statusBox.className = cls;
+    statusText.textContent = text;
+  }
+
+  function fmt(v) {
+    return (v === null || v === undefined) ? '--' : Number(v).toFixed(3);
+  }
+
+  // 原始 ADC 计数（整数），用于和板端串口日志三处对账
+  function rawTxt(v) {
+    return (v === null || v === undefined) ? '--' : String(v);
+  }
+
+  function rawTriple(r) {
+    return rawTxt(r.ax_raw) + ' / ' + rawTxt(r.ay_raw) + ' / ' + rawTxt(r.az_raw);
+  }
+
+  function fillDeviceSelect(devices, current) {
+    var sel = el('deviceSelect');
+    var opts = devices.map(function (d) {
+      return '<option value="' + d.device_id + '">' + d.device_id + '（' + d.n + ' 条）</option>';
+    }).join('');
+    if (!opts) opts = '<option value="">（尚未有设备上报）</option>';
+    sel.innerHTML = opts;
+    if (current && devices.some(function (d) { return d.device_id === current; })) {
+      sel.value = current;
+    }
+  }
+
+  function renderLatest(rec, serverNow) {
+    if (!rec) {
+      setStatus('', '服务器在线，但还没有任何设备上报数据');
+      ['ax', 'ay', 'az', 'dev', 'tsDev', 'tsSrv',
+       'rawX', 'rawY', 'rawZ'].forEach(function (id) { el(id).textContent = '--'; });
+      return;
+    }
+    el('ax').innerHTML = fmt(rec.ax) + ' <small>' + rec.unit + '</small>';
+    el('ay').innerHTML = fmt(rec.ay) + ' <small>' + rec.unit + '</small>';
+    el('az').innerHTML = fmt(rec.az) + ' <small>' + rec.unit + '</small>';
+    el('rawX').textContent = 'raw: ' + rawTxt(rec.ax_raw);
+    el('rawY').textContent = 'raw: ' + rawTxt(rec.ay_raw);
+    el('rawZ').textContent = 'raw: ' + rawTxt(rec.az_raw);
+    el('dev').textContent = rec.device_id;
+    el('tsDev').textContent = rec.ts_device || '--';
+    el('tsSrv').textContent = rec.ts_server;
+
+    var age = Date.parse(serverNow) - Date.parse(rec.ts_server);
+    if (isNaN(age)) age = 0;
+    if (age > STALE_MS) {
+      setStatus('stale', '数据未更新：最后一条采集于 ' + rec.ts_server +
+                '（' + Math.round(age / 1000) + ' 秒前），开发板可能已停止上传');
+    } else {
+      setStatus('ok', '实时数据 · ' + Math.round(age / 1000) + ' 秒前更新');
+    }
+  }
+
+  function renderHistory(records) {
+    var body = el('historyBody');
+    if (!records.length) {
+      body.innerHTML = '<tr><td colspan="10" style="color:var(--dim)">等待数据…</td></tr>';
+      return;
+    }
+    body.innerHTML = records.map(function (r) {
+      return '<tr><td class="num">' + r.id + '</td><td>' + r.device_id + '</td><td>' + r.sensor +
+        '</td><td class="num">' + fmt(r.ax) + '</td><td class="num">' + fmt(r.ay) +
+        '</td><td class="num">' + fmt(r.az) + '</td><td class="num">' + rawTriple(r) +
+        '</td><td>' + r.unit + '</td><td class="num">' +
+        (r.ts_device || '--') + '</td><td class="num">' + r.ts_server + '</td></tr>';
+    }).join('');
+  }
+
+  function tick() {
+    if (paused) return;
+    var dev = el('deviceSelect').value;
+    var q = dev ? ('?device_id=' + encodeURIComponent(dev)) : '';
+    Promise.all([
+      fetch('/api/devices').then(function (r) { return r.json(); }),
+      fetch('/api/latest' + q).then(function (r) { return r.json(); }),
+      fetch('/api/history' + q + (q ? '&' : '?') + 'limit=15').then(function (r) { return r.json(); })
+    ]).then(function (res) {
+      fillDeviceSelect(res[0].devices || [], dev);
+      renderLatest(res[1].record, res[1].server_now);
+      renderHistory(res[2].records || []);
+    }).catch(function () {
+      setStatus('err', '无法连接服务器，请确认服务正在运行');
+    });
+  }
+
+  el('pauseBtn').addEventListener('click', function () {
+    paused = !paused;
+    el('pauseBtn').textContent = paused ? '恢复刷新' : '暂停刷新';
+    if (paused) setStatus('', '已暂停刷新（页面显示的是暂停时刻的数据）');
+  });
+  el('deviceSelect').addEventListener('change', tick);
+
+  // 摄像头画面：独立于数据轮询，固定读 /api/frame/latest 并加时间戳防缓存
+  function refreshCam() {
+    var img = el('cam');
+    var note = el('camNote');
+    if (!img) return;
+    img.onload = function () {
+      if (note) note.textContent = '最新帧更新于 ' + new Date().toLocaleTimeString();
+    };
+    img.onerror = function () {
+      if (note) note.textContent = '暂未收到图像（开发板未上传，或帧接口异常）';
+    };
+    img.src = '/api/frame/latest?t=' + Date.now();
+  }
+  setInterval(refreshCam, 1500);
+  refreshCam();
+
+  tick();
+  setInterval(tick, POLL_MS);
+})();
+</script>
+</body>
+</html>

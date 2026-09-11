@@ -1,0 +1,25 @@
+# 构建产物
+build/
+managed_components/
+
+# 运行时生成的数据与日志
+*.db
+*.log
+server_run.log
+server/*.log
+
+# 摄像头帧归档（实时显示只需 latest.jpg，历史帧不入库）
+server/snapshots/
+
+# Python
+__pycache__/
+*.pyc
+
+# 本机 ESP-IDF 沙箱构建辅助脚本（非项目代码，仅本地使用）
+.idf_launch.py
+
+# 代理记忆目录（非项目交付物）
+.workbuddy-ai/
+
+# 本地离线安装包（体积大，不入库）
+tools/*.exe

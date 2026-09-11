@@ -1,0 +1,6 @@
+﻿# Name,       Type, SubType, Offset,   Size,     Flags
+# ESP32-S3-EYE 8MB flash 的分区表。
+# 摄像头固件体积较大，factory 分区扩到 3MB（原默认单 app 仅 1MB 装不下）。
+nvs,          data, nvs,     0x9000,   0x6000,
+phy_init,     data, phy,     0xf000,   0x1000,
+factory,      app,  factory, 0x10000,  0x300000,
