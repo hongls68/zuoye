@@ -21,10 +21,12 @@ ai-week1/
 │       ├── main.c             ← 主流程：采集 → 对时 → 上传，断网只重连不重启
 │       ├── qma7981.c          ← 板载加速度计驱动
 │       ├── qma7981.h
+│       ├── camera.c           ← 板载 OV2640 摄像头驱动（复用 IMU 的 I2C 总线）
+│       ├── camera.h
 │       └── CMakeLists.txt
-├── tools/                     ← 工具与安装包（可删，不影响代码）
-│   ├── esp-idf-tools-setup-offline-5.5.5.exe
-│   └── QMA7981_Datasheet.pdf
+├── tools/                     ← 工具与资料
+│   ├── run_idf.py             ← 构建启动器（规避 Git Bash 下 idf.py 不编译的问题）
+│   └── QMA7981_Datasheet.pdf  ← 原厂数据手册
 └── 三处对账核对.py             ← 辅助脚本：一次验证板/服务器/网页三处数值一致
 ```
 
