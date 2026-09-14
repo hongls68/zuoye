@@ -9,6 +9,8 @@ AI交互课 第1周 —— 最小传感器数据接收与存储服务
   GET  /api/latest?device_id=X    查询某设备最新一条记录
   GET  /api/history?device_id=X&limit=N   查询某设备历史记录（新→旧）
   GET  /api/devices               列出所有上报过的设备及其最后上报时间
+  POST /api/frame?device_id=X     开发板上传一帧 JPEG（原始字节流，单帧上限 1MB）
+  GET  /api/frame/latest?device_id=X  取某设备最新一帧 JPEG（网页 <img> 直接引用）
   GET  /api/health                服务自检
   GET  /                          Web 展示页面（index.html）
 
