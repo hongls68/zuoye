@@ -374,23 +374,31 @@ git commit -m "feat: 新增板载 OV2640 摄像头采集与无线实时传图
 - 启用 PSRAM 与自定义分区表(3MB app)；SCCB 走硬件 I2C 与 IMU 共用 GPIO4/5"
 ```
 
-### 步骤 4：关联 GitHub 远程并推送
+### 步骤 4：关联 GitHub 远程并推送 ✅ 已完成
 
 ```powershell
-git remote add origin https://github.com/<你的用户名>/zuoye.git
+git remote add origin https://github.com/hongls68/zuoye.git
 git branch -M main
 git push -u origin main
 ```
 
 > 若远程仓库已含 README 等文件需先同步：`git pull --rebase origin main` 再 `git push`。
 > 凭据：GitHub 已不支持账户密码，请用 **Personal Access Token（PAT）** 或配置 SSH key；推送时密码框粘贴 PAT 即可。
+> **本仓库为私有（private）**：`firmware/main/app_config.h` 中含 Wi-Fi 名称与密码，不宜公开。
 
-### 提交历史示意
+### 提交历史（实际结果）
 
 ```
-* 2a1b3c  feat: 新增板载 OV2640 摄像头采集与无线实时传图   ← 第二次提交（最终版本）
-* 9f0e2d  chore: 项目目录重命名 zuoye 并初始化 Git…        ← 第一次提交（原始版本）
+* 5b2738d  feat: 新增 OV2640 摄像头采集 + 无线实时传图                     ← 第二次提交（最终版本）
+* fc48008  初始版本：ESP32-S3-EYE 加速度计采集 + Wi-Fi 上传（不含摄像头）   ← 第一次提交（原始版本）
 ```
+
+- 远端仓库：**https://github.com/hongls68/zuoye**（私有，默认分支 `main`）
+- 两个提交共 22 个文件、约 1.0 MB，仓库内无大文件。
+
+> **提交方式说明**：实际未使用上面的 `git stash -u` 技巧，而是先在项目中完整写好摄像头代码，
+> 再用 `git add -A` 分两次提交（第一次提交前先把摄像头相关文件移出、提交后移回），最终同样得到
+> 「第一次=纯原始版本、第二次=含摄像头版本」的两次规范提交。
 
 ---
 
@@ -415,6 +423,14 @@ git push -u origin main
 9. **`.gitignore` 已配置**：忽略 `build/`、`*.db`、`*.log`、`snapshots/`、`__pycache__/`，避免大文件/敏感产物入库。
 
 10. **可选增强：板子端 MJPEG 拉流（更低延迟）**：若老师要求"视频流"而非"准实时图片"，可在板子端起一个 `httpd` 服务（`/stream` 输出 multipart MJPEG），浏览器直接 `http://<板子IP>:81/stream`。实现更复杂且需板子 IP 可达（避开 AP 隔离），本方案默认采用更稳的「板子→电脑 POST」方向。
+
+11. **不要把 ESP-IDF 离线安装包放进仓库**：`tools/esp-idf-tools-setup-offline-5.5.5.exe` 有 **1.51 GB**，
+    而 GitHub 单文件硬上限是 **100 MB**——一旦被提交进历史，`git push` 会被直接拒绝，只能重写历史才能清除。
+    本项目已在 `.gitignore` 中加上 `tools/*.exe`，安装包本体存放在仓库外的 `D:\offline-installers\`。
+
+12. **重写 Git 历史前先备份未跟踪文件**：`git filter-branch` 收尾的 `git reset --hard` 会连带删除
+    **所有未跟踪/被 `.gitignore` 忽略的文件**（如 `.idf_launch.py`、`server/data.db`、`firmware/build/`）。
+    执行前请先把这些文件复制到仓库外。
 
 ---
 

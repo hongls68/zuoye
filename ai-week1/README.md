@@ -66,7 +66,7 @@ ai-week1/
 ### 第 1 步：启动服务端（你的电脑当服务器）
 
 ```powershell
-cd D:\qianwen\ai-week1\server
+cd D:\zuoye\ai-week1\server
 python server.py
 ```
 
@@ -108,7 +108,7 @@ python server.py
 
 ```powershell
 # 打开 ESP-IDF 命令行（开始菜单搜 "ESP-IDF 5.5 PowerShell"）
-cd D:\qianwen\ai-week1\firmware
+cd D:\zuoye\ai-week1\firmware
 
 idf.py set-target esp32s3      # 仅首次需要
 idf.py build                   # 编译
