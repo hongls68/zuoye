@@ -45,7 +45,10 @@
 | PCLK  | 13 | 像素时钟 |
 | PWDN / RESET | -1 | 板载未连接 |
 
-> ⚠️ **共用 I2C 是核心约束**：摄像头 SCCB 与加速度计 I2C 都挂在 GPIO4/5 上。本项目已通过 `CONFIG_CAMERA_SCCB_USE_I2C=y` 让摄像头 SCCB 走**硬件 I2C**（与 QMA7981 共用 I2C_NUM_0），二者分时复用同一总线、GPIO 功能一致，互不干扰。详见第三节。
+> ⚠️ **共用 I2C 是核心约束**：摄像头 SCCB 与加速度计 I2C 都挂在 GPIO4/5 上。本项目通过**两处**配置让摄像头**复用** QMA7981 已建好的 `I2C_NUM_0` 总线：
+> `sdkconfig.defaults` 里 `CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y` + `CONFIG_SCCB_HARDWARE_I2C_PORT0=y`，
+> 以及 `camera.c` 里 `pin_sscb_sda/scl = -1`、`.sccb_i2c_port = I2C_NUM_0`。
+> 二者分时复用同一总线、GPIO 功能一致，互不干扰。详见第三节。
 
 ### 1.3 固件改动（关键代码）
 
@@ -249,14 +252,22 @@ dependencies:
 ```
 > 也可手动执行：`idf.py add-dependency espressif/esp32-camera`
 
-#### (g) `firmware/sdkconfig.defaults`（新增三项，摄像头必需）
+#### (g) `firmware/sdkconfig.defaults`（新增若干项，摄像头必需）
 ```ini
 CONFIG_SPIRAM=y                              # OV2640 帧缓冲需要 PSRAM（板载 8MB）
-CONFIG_CAMERA_SCCB_USE_I2C=y                 # SCCB 走硬件 I2C，与 QMA7981 共用 GPIO4/5
-CONFIG_PARTITION_TABLE_CUSTOM=y             # app 体积变大，需更大分区
+CONFIG_SPIRAM_MODE_OCT=y                     # ESP32-S3-EYE(N8R8) 是 Octal PSRAM，误选 QUAD 会 abort
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y        # SCCB 走硬件 I2C（注意选项名是 CONFIG_SCCB_*）
+CONFIG_SCCB_HARDWARE_I2C_PORT0=y             # 【必须】端口默认是 PORT1，改成 PORT0 才能与 QMA7981 共用总线
+CONFIG_PARTITION_TABLE_CUSTOM=y              # app 体积变大，需更大分区
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 ```
-> 同步在 `firmware/sdkconfig` 中：把 `# CONFIG_PARTITION_TABLE_CUSTOM is not set` 改为 `CONFIG_PARTITION_TABLE_CUSTOM=y`、`# CONFIG_SPIRAM is not set` 改为 `CONFIG_SPIRAM=y`。
+> 同步在 `firmware/sdkconfig` 中：把 `# CONFIG_PARTITION_TABLE_CUSTOM is not set` 改为 `CONFIG_PARTITION_TABLE_CUSTOM=y`、`# CONFIG_SPIRAM is not set` 改为 `CONFIG_SPIRAM=y`，
+> 并把 `# CONFIG_SCCB_HARDWARE_I2C_PORT0 is not set` 改为 `CONFIG_SCCB_HARDWARE_I2C_PORT0=y`（同时把 `CONFIG_SCCB_HARDWARE_I2C_PORT1=y` 注释掉）。
+> **注意**：`firmware/sdkconfig` 已入库，而已存在的 sdkconfig 会**覆盖** `sdkconfig.defaults`，所以两处必须同时改，只改 defaults 不生效。
+>
+> ⚠️ **勘误**：早先版本这里写的是 `CONFIG_CAMERA_SCCB_USE_I2C=y` —— 该选项在 esp32-camera 中**并不存在**，
+> IDF 会静默忽略它，等于完全空转。真正起作用的是上面的 `CONFIG_SCCB_HARDWARE_I2C_PORT0=y`，
+> 以及 `camera.c` 里手动指定 `.sccb_i2c_port = I2C_NUM_0`（第二道保险）。
 
 #### (h) `firmware/partitions.csv` —— 自定义分区表（factory 扩到 3MB）
 ```csv
@@ -404,7 +415,11 @@ git push -u origin main
 
 ## 三、避坑注意事项
 
-1. **共用 I2C（最常踩的坑）**：摄像头 SCCB 与 QMA7981 都接 GPIO4/5。务必开启 `CONFIG_CAMERA_SCCB_USE_I2C=y` 让摄像头走硬件 I2C；否则 esp32-camera 默认用软件 bit-bang，初始化时会把 GPIO4/5 重配为普通 GPIO，覆盖 QMA7981 的 I2C 外设配置，导致加速度计**初始化成功但后续读数为 0/失败**。
+1. **共用 I2C（最常踩的坑）**：摄像头 SCCB 与 QMA7981 都接 GPIO4/5。**只开硬件 I2C 并不够** —— esp32-camera 默认会在 **I2C 端口 1** 上新建总线，引脚却仍指向 GPIO4/5，等于和 QMA7981（端口 0）抢同一对物理线，结果是**加速度计也一起读失败、两类数据全部停传**。两道保险都要上：
+   - `sdkconfig.defaults`：`CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y` + `CONFIG_SCCB_HARDWARE_I2C_PORT0=y`
+     （选项名是 `CONFIG_SCCB_*`，**不是** `CONFIG_CAMERA_SCCB_*`；端口默认 `PORT1`，必须显式改成 `PORT0`）；
+   - `camera.c`：把 `pin_sscb_sda/scl` 设为 `-1`，并指定 `.sccb_i2c_port = I2C_NUM_0`，让摄像头**复用**加速度计已建好的那条总线
+     （I2C 是共享总线，0x12 与 0x30 可共存）。
 
 2. **必须开 PSRAM**：OV2640 帧缓冲放在外部 SPI RAM。不开 `CONFIG_SPIRAM=y`，`esp_camera_init` 会因分配不到 PSRAM 失败。ESP32-S3-EYE(N8R8) 板载 8MB PSRAM，直接开。
 

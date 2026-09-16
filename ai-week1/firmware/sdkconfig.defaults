@@ -25,10 +25,18 @@ CONFIG_SPIRAM=y
 # 误选 QUAD 会在启动时报 "wrong PSRAM line mode" 并 abort。
 CONFIG_SPIRAM_MODE_OCT=y
 
-# 让 SCCB 走硬件 I2C（与板载 QMA7981 共用 I2C_NUM_0 / GPIO4-5）。
-# 否则 esp32-camera 默认用软件 bit-bang SCCB，初始化时重配 GPIO4/5 为普通 GPIO，
+# 让 SCCB 走硬件 I2C，并**显式指定 I2C 端口 0**（与板载 QMA7981 共用 GPIO4-5）。
+# 否则 esp32-camera 默认用软件 bit-bang SCCB，初始化时把 GPIO4/5 重配为普通 GPIO，
 # 覆盖 QMA7981 的硬件 I2C 配置，导致加速度计后续读取失败。
-CONFIG_CAMERA_SCCB_USE_I2C=y
+#
+# 【坑】esp32-camera 的这两个选项名是 CONFIG_SCCB_*，**不是** CONFIG_CAMERA_SCCB_*；
+#      端口默认值是 PORT1，必须显式改成 PORT0，否则会在端口 1 上另建一条总线却仍用 GPIO4/5，
+#      与 QMA7981（端口 0）抢同一对物理线，导致两类数据全部停传。
+#      （历史上这里曾误写为不存在的 CONFIG_CAMERA_SCCB_USE_I2C=y，该行会被静默忽略、完全空转。）
+#      代码侧另有第二道保险：camera.c 里把 pin_sscb_sda/scl 设为 -1、
+#      并指定 .sccb_i2c_port = I2C_NUM_0，直接复用加速度计已建好的那条总线。
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y
+CONFIG_SCCB_HARDWARE_I2C_PORT0=y
 
 # 应用体积变大（esp32-camera 较大），原默认 1MB app 分区装不下，
 # 改用自定义分区表（factory 3MB），分区定义见 partitions.csv。
