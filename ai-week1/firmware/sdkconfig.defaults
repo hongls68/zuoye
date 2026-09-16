@@ -42,3 +42,16 @@ CONFIG_SCCB_HARDWARE_I2C_PORT0=y
 # 改用自定义分区表（factory 3MB），分区定义见 partitions.csv。
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 【排障记录 · 已回退】曾尝试关闭 A-MPDU 聚合（Block-ACK）来绕开
+# 「AP 反复建/拆 BA 会话导致数据帧发不出去」的怀疑：
+#     CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+#     CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+# 实测结果：**无效**。关闭后上传依旧大面积失败（50 秒 0 成功），
+# 说明根因不在聚合层，已恢复 IDF 默认值。
+# 保留这段记录，是为了避免以后重复做同一个无效实验。
+#
+# 当时观察到的现象（供以后参考）：
+#   - 串口：I wifi:<ba-add>idx:1 (ifx:0, ...), tid:0 ... 紧接着 I wifi:<ba-del>idx:1, tid:0
+#   - 板子：select() timeout / Connection timed out before data was ready
+#   - 电脑：netstat 有 ESTABLISHED，但服务端日志无任何请求（数据没送达）

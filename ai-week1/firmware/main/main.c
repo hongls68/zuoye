@@ -122,6 +122,27 @@ static esp_err_t wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /*
+     * 【关键】关闭 Wi-Fi 省电（Modem-sleep），必须在 esp_wifi_start() 之后调用。
+     *
+     * ESP-IDF 默认让 STA 连上后进入 WIFI_PS_MIN_MODEM（省电最小模式），
+     * 串口会打印 `wifi:pm start, type: 1`。此时板子按「监听间隔」周期性休眠，
+     * 入站帧由 AP 缓存、等到 DTIM 才下发；某些 AP 还会把监听间隔放大
+     * （实测某校园 AP 从 102ms 放大到 307ms，日志：scale listen interval ... 307200 us）。
+     *
+     * 后果就是本工程踩到的坑：板子发完 SYN 立刻休眠，SYN-ACK 被 AP 压着不往下发，
+     * 表现为「Wi-Fi 显示已连接、RSSI 高达 -36 dBm，但 HTTP 一直连不上」：
+     *     E esp-tls: [sock=54] select() timeout
+     *     E transport_base: Failed to open a new connection: 32774
+     *     E HTTP_CLIENT: Connection failed, sock < 0
+     * 甚至偶发连上了但 POST 的数据帧发不出去，服务器收不到完整请求：
+     *     W HTTP_CLIENT: Connection timed out before data was ready!
+     *
+     * 关掉省电后射频常开、即收即回，代价是功耗略升。
+     * 本项目由 USB 供电，功耗不是约束，因此始终关闭。
+     */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
     ESP_LOGI(TAG, "正在连接 Wi-Fi: %s", WIFI_SSID);
     return ESP_OK;
 }
@@ -299,16 +320,20 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
     esp_http_client_set_header(client, "X-Device-Id", DEVICE_ID);
     esp_http_client_set_header(client, "X-Ts-Device", ts_device);
 
-    esp_err_t err = ESP_OK;
-    if (esp_http_client_open(client, len) == ESP_OK) {
+    /*
+     * 【坑】这里必须原样保留 esp_http_client_open() 返回的错误码。
+     * 早期版本写成 `if (open(...) == ESP_OK) {...} else { err = ESP_FAIL; }`，
+     * 把 ESP_ERR_HTTP_CONNECT / ESP_ERR_HTTP_READ_TIMEOUT 等真实原因统一压成
+     * ESP_FAIL，串口只剩一句「帧上传失败: ESP_FAIL」，排查时等于自断线索。
+     */
+    esp_err_t err = esp_http_client_open(client, len);
+    if (err == ESP_OK) {
         int written = esp_http_client_write(client, (const char *)buf, len);
         if (written < 0) {
             err = ESP_FAIL;
         } else {
             err = esp_http_client_fetch_headers(client);
         }
-    } else {
-        err = ESP_FAIL;
     }
 
     if (err == ESP_OK) {

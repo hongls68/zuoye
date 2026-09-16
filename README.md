@@ -84,7 +84,9 @@ zuoye/
 
 ## 五、说明
 
-- **本仓库为私有（private）**：`firmware/main/app_config.h` 中含 Wi-Fi 名称与密码，不宜公开。
+- **本仓库为公开（public）**，用于课程作业提交与演示。
+  注意 `firmware/main/app_config.h` 中的 Wi-Fi 名称/密码**仅属本课程演示环境**；
+  若复用本仓库代码，请先把凭据替换成自己的 —— 建议放进不进版本库的 `secrets.h`，并在 `.gitignore` 中忽略它。
 - `firmware/build/`、`firmware/managed_components/`、`server/data.db`、`server/snapshots/`、`*.log`
   等构建产物与运行时数据均已被 `.gitignore` 忽略，首次 `idf.py build` 会自动下载 `esp32-camera` 组件。
 - 1.5 GB 的 ESP-IDF 离线安装包**不入库**（超 GitHub 单文件 100 MB 上限），存放在仓库外的 `D:\offline-installers\`。
