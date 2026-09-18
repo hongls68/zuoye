@@ -1,10 +1,17 @@
 /*
- * main.c —— AI交互课 第1周 设备端固件
+ * main.c —— AI交互课 设备端固件
  *
  * 职责：
  *   1) 读取 ESP32-S3-EYE 板载 QMA7981 三轴加速度计（真实测量值）
  *   2) 通过 Wi-Fi 把「数值 + 单位 + 时间戳 + 设备编号」POST 到自建服务器
  *   3) 每秒一次；网络异常时只重连、不重启，不产生假数据
+ *   4) 【第2周】按周期轮询服务器的「远程采集指令」，取到就立即回执、
+ *      抓一帧带上 request_id / capture_ts / boot_id / seq 回传
+ *
+ * 第2周为什么要多带三个字段：
+ *   服务器要能回答「这张图到底是不是这次拍的那张」。只靠 request_id 不够 ——
+ *   如果板子把上一次拍的同一张图重传一次，请求对得上、时间也可能对得上。
+ *   所以还要 boot_id（本次开机标识）+ seq（开机内递增序号）来证明"确实新拍了一张"。
  *
  * 配置：所有需要修改的内容集中在 app_config.h（Wi-Fi、服务器地址、设备编号）
  */
@@ -46,6 +53,14 @@ static EventGroupHandle_t s_wifi_evt;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_time_synced = false;
 static bool s_camera_ok = false;   /* 摄像头是否初始化成功（失败则降级）*/
+
+/* ---- 第2周：新鲜度标识 ----
+ * s_boot_id：本次开机的标识，存在 NVS 里的开机计数 + MAC 尾号，重启必变。
+ * s_seq    ：开机内递增序号，随每一帧上传自增；重启后归零（配合 boot_id 使用）。
+ * 服务器用 (boot_id, seq) 的组合判断"这一帧是不是新拍的"，见 server.py 的 E3 校验。
+ */
+static char s_boot_id[24] = {0};
+static uint32_t s_seq = 0;
 
 /* ---------------- Wi-Fi ---------------- */
 
@@ -297,11 +312,21 @@ static esp_err_t upload_reading(const qma7981_sample_t *s,
 /* ---------------- 摄像头帧上传 ----------------
  *
  * 把一帧 JPEG 作为二进制 body POST 到服务器 /api/frame（沿用加速度上报的 HTTP 客户端）。
- * 用自定义请求头携带设备编号与板端时间，便于服务器落库与展示。
+ * 用自定义请求头携带设备编号、板端时间与新鲜度标识，便于服务器落库、关联与校验：
+ *
+ *   X-Device-Id   设备编号
+ *   X-Ts-Device   上传时刻
+ *   X-Capture-Ts  采集时刻（E2 时序校验用：必须晚于指令下发时刻）
+ *   X-Boot-Id     本次开机标识（E3）
+ *   X-Seq         开机内递增序号（E3）
+ *   X-Request-Id  本次所属请求 —— 只有命令触发的帧才带；
+ *                 周期性抓拍不带它，服务器那边就只入库、不参与命令闭环。
+ *
  * 失败不致命：下一帧会重试，不阻塞加速度上传。
  */
 static esp_err_t upload_frame(const uint8_t *buf, size_t len,
-                              const char *ts_device)
+                              const char *ts_device, const char *capture_ts,
+                              const char *request_id)
 {
     char url[192];
     snprintf(url, sizeof(url), "%s/api/frame", SERVER_URL);
@@ -316,9 +341,27 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
         return ESP_FAIL;
     }
 
+    /*
+     * 序号在真正要发的时候才自增，保证「seq 的大小顺序 == 服务器收到的顺序」。
+     * 这是 E3 校验成立的前提：如果先自增后上传，一旦上传失败或乱序，
+     * 服务器看到的序号就不单调了。
+     */
+    s_seq++;
+
+    char seq_buf[16];
+    snprintf(seq_buf, sizeof(seq_buf), "%lu", (unsigned long)s_seq);
+
     esp_http_client_set_header(client, "Content-Type", "image/jpeg");
     esp_http_client_set_header(client, "X-Device-Id", DEVICE_ID);
     esp_http_client_set_header(client, "X-Ts-Device", ts_device);
+    esp_http_client_set_header(client, "X-Capture-Ts",
+                               (capture_ts && capture_ts[0]) ? capture_ts
+                                                             : ts_device);
+    esp_http_client_set_header(client, "X-Boot-Id", s_boot_id);
+    esp_http_client_set_header(client, "X-Seq", seq_buf);
+    if (request_id && request_id[0]) {
+        esp_http_client_set_header(client, "X-Request-Id", request_id);
+    }
 
     /*
      * 【坑】这里必须原样保留 esp_http_client_open() 返回的错误码。
@@ -339,8 +382,21 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
-            ESP_LOGI(TAG, "帧上传成功 (HTTP %d, %u bytes)", status,
-                     (unsigned int)len);
+            ESP_LOGI(TAG, "帧上传成功 (HTTP %d, %u bytes, seq=%lu)", status,
+                     (unsigned int)len, (unsigned long)s_seq);
+            /*
+             * 命令触发的帧：服务器会在响应里带回证据校验结论。
+             * 把它打到串口，就能当场看出「这次算不算成功、不成功是差哪条证据」，
+             * 不用再去翻服务器日志对时间。周期性抓拍的响应没有这个字段，跳过。
+             */
+            if (request_id && request_id[0]) {
+                char resp[192];
+                int n = esp_http_client_read(client, resp, sizeof(resp) - 1);
+                if (n > 0) {
+                    resp[n] = '\0';
+                    ESP_LOGI(TAG, "  指令 %s 证据校验结论: %s", request_id, resp);
+                }
+            }
         } else {
             ESP_LOGE(TAG, "帧服务器返回异常状态码 %d", status);
             err = ESP_FAIL;
@@ -352,6 +408,211 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return err;
+}
+
+/* ---------------- 远程采集指令通道（第2周）----------------
+ *
+ * 三个函数的职责划分：
+ *   boot_id_init()          生成"本次开机"的标识（存 NVS 的开机计数 + MAC 尾号）
+ *   command_poll()          向服务器要一条待执行指令；没有待执行指令返回 false
+ *   command_ack()           回执。取到指令要**立即**回执，抓图失败再回执一次 FAILED
+ *   handle_remote_command() 把上面几步和抓帧、回传串起来
+ *
+ * 为什么回执要"立即"：
+ *   服务器只有收到回执，才能把状态从 PENDING 推到 RECEIVED。
+ *   如果等到抓完图再回执，"设备已接收"和"已完成"之间的时间差就没了，
+ *   出问题时看不出是"没收到指令"还是"收到了但抓图失败"。
+ */
+static void boot_id_init(void)
+{
+    uint32_t count = 0;
+    nvs_handle_t h;
+    if (nvs_open("app", NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_get_u32(h, "boot_cnt", &count) != ESP_OK) {
+            count = 0;                  /* 首次开机，NVS 里还没有这个键 */
+        }
+        count++;
+        nvs_set_u32(h, "boot_cnt", count);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(s_boot_id, sizeof(s_boot_id), "%02x%02x%02x-boot%lu",
+             mac[3], mac[4], mac[5], (unsigned long)count);
+    ESP_LOGI(TAG, "本次开机标识 boot_id = %s（重启后会变，供服务器做新鲜度校验）",
+             s_boot_id);
+}
+
+/* 取一条待执行指令。取到 -> true 并填好 request_id；没有 -> false（这是常态）。 */
+static bool command_poll(char *request_id, size_t len)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/command/poll?device_id=%s",
+             SERVER_URL, DEVICE_ID);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = CMD_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        return false;
+    }
+
+    /*
+     * 响应体用固定大小缓冲一次读完。
+     * 服务器那边专门做了精简载荷（只有 request_id / action / ttl 等执行必需字段），
+     * 就是为了让这里不用动态扩容 —— MCU 上的内存是实打实的约束。
+     */
+    char body[512];
+    int rd = 0;
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err == ESP_OK) {
+        err = esp_http_client_fetch_headers(client);
+    }
+    if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+        while (rd < (int)sizeof(body) - 1) {
+            int n = esp_http_client_read(client, body + rd,
+                                         sizeof(body) - 1 - rd);
+            if (n <= 0) {
+                break;
+            }
+            rd += n;
+        }
+    } else if (err != ESP_OK) {
+        /* 取指令失败不影响周期上报，下一轮再试即可，不必刷错误日志 */
+        ESP_LOGW(TAG, "取指令失败: %s（不影响周期上报，下轮重试）",
+                 esp_err_to_name(err));
+    }
+    body[rd] = '\0';
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    bool got = false;
+    cJSON *root = cJSON_Parse(body);
+    if (root != NULL) {
+        cJSON *cmd = cJSON_GetObjectItem(root, "command");
+        /* 没有待执行指令时服务器返回 {"command": null}，cJSON_IsObject 为假 */
+        if (cJSON_IsObject(cmd)) {
+            cJSON *rid = cJSON_GetObjectItem(cmd, "request_id");
+            if (cJSON_IsString(rid) && rid->valuestring[0] != '\0') {
+                strncpy(request_id, rid->valuestring, len - 1);
+                request_id[len - 1] = '\0';
+                got = true;
+            }
+        }
+        cJSON_Delete(root);
+    }
+    return got;
+}
+
+/* 回执。state 传 NULL 表示"已接收，开始执行"；传 "FAILED" 表示执行不了。 */
+static esp_err_t command_ack(const char *request_id, const char *state,
+                             const char *reason)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    char ts_device[48];
+    make_device_timestamp(ts_device, sizeof(ts_device));
+
+    cJSON_AddStringToObject(root, "request_id", request_id);
+    cJSON_AddStringToObject(root, "device_id", DEVICE_ID);
+    cJSON_AddStringToObject(root, "device_ts", ts_device);
+    cJSON_AddStringToObject(root, "boot_id", s_boot_id);
+    cJSON_AddNumberToObject(root, "seq", s_seq);
+    if (state != NULL) {
+        cJSON_AddStringToObject(root, "state", state);
+    }
+    if (reason != NULL) {
+        cJSON_AddStringToObject(root, "reason", reason);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char url[192];
+    snprintf(url, sizeof(url), "%s/api/command/ack", SERVER_URL);
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = CMD_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        free(payload);
+        return ESP_FAIL;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    esp_err_t err = esp_http_client_open(client, strlen(payload));
+    if (err == ESP_OK) {
+        int written = esp_http_client_write(client, payload, strlen(payload));
+        err = (written < 0) ? ESP_FAIL : esp_http_client_fetch_headers(client);
+    }
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        if (status >= 200 && status < 300) {
+            ESP_LOGI(TAG, "回执成功 (HTTP %d): %s -> %s", status, request_id,
+                     (state != NULL) ? state : "EXECUTING");
+        } else {
+            ESP_LOGE(TAG, "回执失败，服务器返回 %d", status);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "回执请求失败: %s", esp_err_to_name(err));
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(payload);
+    return err;
+}
+
+/* 完整执行一条远程指令：立即回执 -> 抓帧 -> 带上 request_id 回传 -> 打印校验结论 */
+static void handle_remote_command(void)
+{
+    char request_id[64];
+    if (!command_poll(request_id, sizeof(request_id))) {
+        return;                     /* 没有待执行指令，正常情况，不打印日志 */
+    }
+    ESP_LOGI(TAG, ">>> 取到远程指令 %s，开始执行", request_id);
+
+    /* 第一步：立即回执。这是「设备已接收」状态唯一的证据来源 */
+    command_ack(request_id, NULL, NULL);
+
+#if CAMERA_ENABLE
+    if (!s_camera_ok) {
+        ESP_LOGE(TAG, "指令 %s 无法执行：摄像头不可用", request_id);
+        command_ack(request_id, "FAILED", "camera not available");
+        return;
+    }
+    camera_fb_t *fb = camera_capture();
+    if (fb == NULL) {
+        ESP_LOGE(TAG, "指令 %s 无法执行：抓帧失败", request_id);
+        command_ack(request_id, "FAILED", "capture failed");
+        return;
+    }
+    /*
+     * 采集时刻单独取一次，而不是复用上传时刻。
+     * E2 校验比的就是"采集时刻"和"指令下发时刻"的先后 ——
+     * 如果直接拿上传时刻充数，那它必然晚于下发时刻，校验就成了走过场。
+     */
+    char capture_ts[48];
+    make_device_timestamp(capture_ts, sizeof(capture_ts));
+    ESP_LOGI(TAG, "指令 %s 抓取一帧 %u bytes，带 request_id 回传", request_id,
+             (unsigned int)fb->len);
+    upload_frame(fb->buf, fb->len, capture_ts, capture_ts, request_id);
+    esp_camera_fb_return(fb);
+#else
+    ESP_LOGE(TAG, "指令 %s 无法执行：固件编译时未启用摄像头", request_id);
+    command_ack(request_id, "FAILED", "camera disabled in build");
+#endif
 }
 
 /* ---------------- 主流程 ---------------- */
@@ -379,6 +640,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* 1.5) 生成本次开机标识（供服务器做 E3 新鲜度校验），必须在 NVS 就绪之后 */
+    boot_id_init();
 
     /* 2) 初始化板载加速度计。失败时不上传任何数据，只报错。 */
     uint8_t chip_id = 0;
@@ -421,14 +685,38 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "开始循环采集并上传，周期 %d ms", SAMPLE_PERIOD_MS);
+#if CMD_ENABLE
+    ESP_LOGI(TAG, "远程指令通道已启用，取指令周期 %d ms（与周期上报相互独立）",
+             CMD_POLL_INTERVAL_MS);
+#endif
 
     /* 6) 主循环 */
     uint32_t fail_streak = 0;
 #if CAMERA_ENABLE
     int64_t last_cam_us = -((int64_t)CAMERA_PERIOD_MS * 1000);  /* 首帧立即抓 */
 #endif
+#if CMD_ENABLE
+    int64_t last_poll_us = -((int64_t)CMD_POLL_INTERVAL_MS * 1000); /* 首轮立即取 */
+#endif
     while (true) {
         int64_t t0 = esp_timer_get_time();
+
+        /*
+         * 0) 命令通道：按自己的节拍取指令。
+         *
+         * 刻意放在周期采集之前、且用独立的计时变量 —— 这样即使把
+         * SAMPLE_PERIOD_MS 调大、或者暂停周期上报，命令通道依然照常工作。
+         * 课程明确的检查项就是这一条：「暂停周期上报后，命令触发仍能出新数据」。
+         */
+#if CMD_ENABLE
+        if (s_wifi_connected) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_poll_us >= (int64_t)CMD_POLL_INTERVAL_MS * 1000) {
+                last_poll_us = now_us;
+                handle_remote_command();
+            }
+        }
+#endif
 
         qma7981_sample_t s;
         ret = qma7981_read(&s);
@@ -476,9 +764,12 @@ void app_main(void)
                 last_cam_us = now_us;
                 camera_fb_t *fb = camera_capture();
                 if (fb) {
-                    ESP_LOGI(TAG, "抓取一帧 %u bytes，上传中…",
+                    /* 周期性抓拍不带 request_id：服务器那边只入库，不参与命令闭环 */
+                    char cap_ts[48];
+                    make_device_timestamp(cap_ts, sizeof(cap_ts));
+                    ESP_LOGI(TAG, "周期抓取一帧 %u bytes，上传中…",
                              (unsigned int)fb->len);
-                    upload_frame(fb->buf, fb->len, ts_device);
+                    upload_frame(fb->buf, fb->len, cap_ts, cap_ts, NULL);
                     esp_camera_fb_return(fb);
                 }
             }

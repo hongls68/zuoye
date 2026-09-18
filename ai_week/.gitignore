@@ -1,5 +1,5 @@
-# 构建产物
-build/
+# 构建产物（含搬移目录后残留的 build.stale_paths 等）
+build*/
 managed_components/
 
 # 运行时生成的数据与日志
