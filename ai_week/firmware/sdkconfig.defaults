@@ -55,3 +55,34 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 #   - 串口：I wifi:<ba-add>idx:1 (ifx:0, ...), tid:0 ... 紧接着 I wifi:<ba-del>idx:1, tid:0
 #   - 板子：select() timeout / Connection timed out before data was ready
 #   - 电脑：netstat 有 ESTABLISHED，但服务端日志无任何请求（数据没送达）
+
+# ---------------------------------------------------------------------------
+# 【关键】lwIP 连接资源上限 —— 治"高频短连接把 PCB 耗光"
+#
+# 症状：板子跑约 10~20 秒后开始大面积上报失败，串口出现
+#         W transport_base: Poll timeout or error,
+#           errno=Connection already in progress, fd=54, timeout_ms=8000
+#         E transport_base: tcp_read error, errno=Connection reset by peer
+#         E app: 上传失败 / 帧上传失败 / 取指令失败（连续失败次数不断累加）
+#       复位后前 10 秒左右正常，随后又复发。
+#
+# 原因：本固件每次上报都新建一条 TCP 连接，没有复用。
+#       POST /api/ingest 每 1 秒、POST /api/frame 每 2 秒、GET /api/command/poll 每 5 秒，
+#       合计约 1.7 条/秒。连接关闭后 PCB 还要在 TIME_WAIT / FIN_WAIT 里滞留一段时间，
+#       而 IDF 默认上限只有 10 个 socket、16 条活动 TCP，FIN_WAIT 要等 20 秒，
+#       于是不到 20 秒就把 PCB 用光，之后**所有**新连接一律失败。
+#
+#       （第 1 周记录的"98% 请求失败率"很可能就是同一个根因，
+#         当时误判为校园网 AP 隔离 —— 那条 A-MPDU 实验之所以无效，
+#         也是因为它根本没碰到连接资源这一层。）
+#
+# 处理：放宽上限 + 缩短滞留时间，让"用完即回收"跟得上"每秒新建"。
+#       48 条 PCB 约多占 12 KB RAM，ESP32-S3 完全放得下。
+#
+# 【注意】sdkconfig 已存在时会覆盖 sdkconfig.defaults，改完这里
+#         要么一并改 sdkconfig，要么删掉 sdkconfig 重新生成。
+CONFIG_LWIP_MAX_SOCKETS=24
+CONFIG_LWIP_MAX_ACTIVE_TCP=48
+CONFIG_LWIP_TCP_MSL=10000
+CONFIG_LWIP_TCP_FIN_WAIT_TIMEOUT=5000
+

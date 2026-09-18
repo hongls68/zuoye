@@ -338,13 +338,27 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # ---------- 工具 ----------
+    def _end_headers_close(self) -> None:
+        """收尾响应头，并明确告诉对方「这条连接用完就关」。
+
+        本服务端跑在 HTTP/1.1 上，而 HTTP/1.1 默认是**持久连接**。
+        设备端固件用的却是短连接语义：它读完响应头就直接 close socket，
+        从不发 Connection: close。两边语义不一致会留下半开连接 ——
+        服务端仍认为连接有效、继续等下一个请求，而板子早已离开，
+        服务端随后读到 RST，日志里刷 ConnectionResetError；
+        板子那边也会在后续请求上撞到 errno=Connection already in progress。
+        显式回 Connection: close 把语义对齐，两边都干净。
+        """
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
     def _send_json(self, obj: dict, code: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._end_headers_close()
 
     def _send_html(self) -> None:
         try:
@@ -356,7 +370,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
+        self._end_headers_close()
         self.wfile.write(body)
 
     def _query(self) -> dict:
@@ -395,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         # 请求级图像内容不会变，但仍禁用缓存，避免课堂上"换了图没变"的误会
         self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self._end_headers_close()
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):  # 精简日志

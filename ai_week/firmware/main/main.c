@@ -236,6 +236,28 @@ static void make_device_timestamp(char *buf, size_t len)
 
 /* ---------------- 上传 ---------------- */
 
+/* 把 HTTP 响应体读干净，再关闭连接。
+ *
+ * 【坑·本工程实测踩到，且极具迷惑性】
+ * 只 fetch_headers 就把 socket 关掉会出大问题：服务端每个响应都带一小段
+ * JSON（Content-Length 明确），客户端不读走的话，接收缓冲区里还留着未读
+ * 数据，协议栈会直接发 RST 而不是正常四次挥手。后果有两个：
+ *   1) 服务端记一条 ConnectionResetError，看起来像客户端崩了；
+ *   2) 客户端这边 fd 迟迟回收不掉，很快撞上
+ *      errno=Connection already in progress / esp-tls: select() timeout。
+ *
+ * 现象极具迷惑性：**服务端日志里每秒都是 201，板子串口却一路刷
+ * "连续上传失败 N 次"** —— 数据其实已经入库了，是板子把成功的请求判成了
+ * 失败。排空响应体之后，两边结论就一致了。
+ */
+static void http_drain_body(esp_http_client_handle_t client)
+{
+    char buf[64];
+    while (esp_http_client_read(client, buf, sizeof(buf)) > 0) {
+        /* 只为排空，内容丢弃 */
+    }
+}
+
 static esp_err_t upload_reading(const qma7981_sample_t *s,
                                 const char *ts_device)
 {
@@ -291,6 +313,8 @@ static esp_err_t upload_reading(const qma7981_sample_t *s,
 
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
+        /* 响应体必须读走再关连接，否则协议栈会发 RST（见 http_drain_body 注释）*/
+        http_drain_body(client);
         if (status >= 200 && status < 300) {
             ESP_LOGI(TAG, "上传成功 (HTTP %d): ax=%.3f ay=%.3f az=%.3f g",
                      status, s->ax, s->ay, s->az);
@@ -397,6 +421,8 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
                     ESP_LOGI(TAG, "  指令 %s 证据校验结论: %s", request_id, resp);
                 }
             }
+            /* 上面最多只读走 192 字节，剩下的必须排空（见 http_drain_body 注释）*/
+            http_drain_body(client);
         } else {
             ESP_LOGE(TAG, "帧服务器返回异常状态码 %d", status);
             err = ESP_FAIL;
@@ -558,6 +584,8 @@ static esp_err_t command_ack(const char *request_id, const char *state,
     }
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
+        /* 响应体必须读走再关连接，否则协议栈会发 RST（见 http_drain_body 注释）*/
+        http_drain_body(client);
         if (status >= 200 && status < 300) {
             ESP_LOGI(TAG, "回执成功 (HTTP %d): %s -> %s", status, request_id,
                      (state != NULL) ? state : "EXECUTING");
