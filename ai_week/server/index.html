@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>开发板传感器数据看板 · AI交互课第1周</title>
+<title>开发板传感器数据看板 · AI交互课</title>
 <style>
   :root {
     --bg: #0f172a; --card: #1e293b; --line: #334155;
     --txt: #e2e8f0; --dim: #94a3b8; --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    --info: #60a5fa;
   }
   * { box-sizing: border-box; }
   body {
@@ -48,11 +49,34 @@
   .cam .label { color: var(--dim); font-size: 12px; margin-bottom: 8px; }
   .cam img { width: 100%; max-width: 520px; border-radius: 8px; border: 1px solid var(--line); background: #000; display: block; }
   .cam .camnote { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  /* ---- 第2周：远程采集指令 ---- */
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; border: 1px solid var(--line); background: var(--bg); color: var(--dim);
+  }
+  .badge.ok   { color: var(--ok);   border-color: var(--ok); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.info { color: var(--info); border-color: var(--info); }
+  .badge.err  { color: var(--err);  border-color: var(--err); }
+  .code { font-family: Consolas, "Courier New", monospace; font-size: 12px; color: var(--dim); }
+  .reqbody { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+  .reqimg { flex: 0 0 340px; max-width: 100%; }
+  .reqimg img { width: 100%; border-radius: 8px; border: 1px solid var(--line); background: #000; display: none; }
+  .reqph {
+    width: 100%; min-height: 220px; display: flex; align-items: center; justify-content: center;
+    border: 1px dashed var(--line); border-radius: 8px; color: var(--dim);
+    font-size: 13px; text-align: center; padding: 14px; line-height: 1.7; white-space: pre-line;
+  }
+  .timeline { list-style: none; margin: 0; padding: 0; flex: 1 1 280px; font-size: 12px; }
+  .timeline li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .timeline .tstate { color: var(--txt); }
+  .timeline .twhen { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .timeline li.dim { color: var(--dim); justify-content: flex-start; }
 </style>
 </head>
 <body>
   <h1>开发板传感器数据看板</h1>
-  <div class="sub">AI交互课 第1周 · ESP32-S3-EYE 板载加速度计（QMA7981）实时数据</div>
+  <div class="sub">AI交互课 · ESP32-S3-EYE 板载 QMA7981 加速度计 + OV2640 摄像头 · 支持远程下发采集指令</div>
 
   <div class="toolbar">
     <span id="status"><span class="dot"></span><span id="statusText">连接中…</span></span>
@@ -77,12 +101,35 @@
   </table>
 
   <section class="cam">
+    <div class="label">远程采集 · 点一下让开发板「现在」拍一张（区别于刷新页面）</div>
+    <div class="toolbar" style="margin-bottom:12px">
+      <button id="captureBtn">采集一次最新数据</button>
+      <span id="reqState" class="badge">尚未下发</span>
+      <span class="code" id="reqId">--</span>
+    </div>
+    <div class="reqbody">
+      <div class="reqimg">
+        <img id="reqCam" alt="本次请求的图像">
+        <div class="reqph" id="reqPlaceholder">尚未下发指令<br>下发后这里只会显示「本次请求」的图像，<br>请求没完成时不会拿旧图顶上</div>
+      </div>
+      <ol class="timeline" id="reqTimeline"><li class="dim">暂无进展</li></ol>
+    </div>
+    <div class="camnote" id="reqNote">刷新页面只是重新读数据库，不会产生新采集；只有下发指令并走完闭环，才会出现新图。</div>
+  </section>
+
+  <table>
+    <thead><tr><th>请求编号</th><th>状态</th><th>指令下发</th><th>采集时刻</th><th>开机标识 / 序号</th><th>图像</th></tr></thead>
+    <tbody id="reqBody"><tr><td colspan="6" style="color:var(--dim)">还没有下发过指令</td></tr></tbody>
+  </table>
+
+  <section class="cam">
     <div class="label">实时摄像头 · 板载 OV2640（充电宝供电脱机也能无线传图到电脑）</div>
     <img id="cam" alt="等待图像…">
     <div class="camnote" id="camNote">等待开发板上传第一帧…</div>
   </section>
 
-  <div class="note">说明：本页数值全部来自服务器查询接口 /api/latest 与 /api/history，不含任何写死的演示数据。停止采集后，页面将保留最后一条记录的时间并提示"数据未更新"。摄像头画面来自 /api/frame/latest，开发板停止上传后定格在最后一帧。</div>
+  <div class="note">说明：本页数值全部来自服务器查询接口 /api/latest 与 /api/history，不含任何写死的演示数据。停止采集后，页面将保留最后一条记录的时间并提示"数据未更新"。摄像头画面来自 /api/frame/latest，开发板停止上传后定格在最后一帧。<br>
+  远程采集区与上面的周期数据是两条独立通道：暂停刷新只停住上面的数据视图，指令通道照常工作 —— 这正是「暂停周期上报后，命令触发仍能出新数据」要验证的行为。请求编号 / 采集时刻 / 开机标识+序号 这三组信息就是用来回答"这张图到底是不是这次拍的"。</div>
 
 <script>
 (function () {
@@ -186,7 +233,136 @@
     el('pauseBtn').textContent = paused ? '恢复刷新' : '暂停刷新';
     if (paused) setStatus('', '已暂停刷新（页面显示的是暂停时刻的数据）');
   });
-  el('deviceSelect').addEventListener('change', tick);
+  el('deviceSelect').addEventListener('change', function () {
+    tick();
+    refreshRequests();   // 换设备时，指令列表与当前追踪的请求一起跟着切
+  });
+
+  // ================= 第2周：远程采集指令 =================
+  // 与上面的数据轮询是两条独立通道：暂停刷新只停住数据视图，指令通道照常工作。
+
+  var activeReqId = null;    // 当前正在追踪的请求编号
+  var shownFrameReq = null;  // 已经贴到 <img> 上的请求编号（避免每秒重复加载同一张图）
+
+  function badgeCls(state) {
+    if (state === 'COMPLETED') return 'ok';
+    if (state === 'PENDING') return 'warn';
+    if (state === 'RECEIVED' || state === 'EXECUTING' || state === 'UPLOADED') return 'info';
+    return 'err';
+  }
+
+  function setReqNote(text) { el('reqNote').textContent = text; }
+
+  function renderRequest(cmd) {
+    var b = el('reqState');
+    b.className = 'badge ' + badgeCls(cmd.state);
+    b.textContent = cmd.state_label;
+    el('reqId').textContent = cmd.request_id;
+
+    // 图像槽：只有证据齐全（has_frame）才显示图。
+    // 未完成 / 失败 / 过期时一律只显示占位文案，绝不回落到"最新帧" ——
+    // 否则「设备关机后点一下还能看到图」就说明我们在拿旧值冒充。
+    var img = el('reqCam'), ph = el('reqPlaceholder');
+    if (cmd.has_frame) {
+      ph.style.display = 'none';
+      img.style.display = 'block';
+      if (shownFrameReq !== cmd.request_id) {
+        shownFrameReq = cmd.request_id;
+        img.onerror = function () {
+          img.style.display = 'none';
+          ph.style.display = 'block';
+          ph.textContent = '图像读取失败（请确认服务端 snapshots/ 目录里还有这一帧）';
+        };
+        img.src = '/api/command/frame?request_id=' +
+                  encodeURIComponent(cmd.request_id) + '&t=' + Date.now();
+      }
+    } else {
+      img.style.display = 'none';
+      img.removeAttribute('src');
+      shownFrameReq = null;
+      ph.style.display = 'block';
+      ph.textContent = (cmd.is_final ? '未完成 · ' : '等待中 · ') + cmd.state_label +
+                       (cmd.fail_reason ? ('\n' + cmd.fail_reason) : '');
+    }
+
+    var tl = el('reqTimeline');
+    tl.innerHTML = (cmd.timeline || []).map(function (t) {
+      return '<li><span class="tstate">' + t.label + '</span>' +
+             '<span class="twhen">' + t.at + '</span></li>';
+    }).join('') || '<li class="dim">暂无进展</li>';
+
+    setReqNote('指令下发 ' + cmd.created_at +
+               ' · 采集时刻 ' + (cmd.capture_ts || '--') +
+               ' · 有效期至 ' + cmd.expires_at +
+               (cmd.evidence_ok === 0 ? ' · 证据校验未通过' : ''));
+  }
+
+  function renderRequestList(cmds) {
+    var body = el('reqBody');
+    if (!cmds.length) {
+      body.innerHTML = '<tr><td colspan="6" style="color:var(--dim)">还没有下发过指令</td></tr>';
+      return;
+    }
+    body.innerHTML = cmds.map(function (c) {
+      var seqTxt = (c.seq === null || c.seq === undefined) ? '--' : c.seq;
+      return '<tr>' +
+        '<td class="code">' + c.request_id + '</td>' +
+        '<td><span class="badge ' + badgeCls(c.state) + '">' + c.state_label + '</span></td>' +
+        '<td class="num">' + c.created_at + '</td>' +
+        '<td class="num">' + (c.capture_ts || '--') + '</td>' +
+        '<td class="num">' + (c.boot_id || '--') + ' / ' + seqTxt + '</td>' +
+        '<td>' + (c.has_frame ? '已出图' : '未完成') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function refreshRequests() {
+    var dev = el('deviceSelect').value;
+    var listQ = dev ? ('?device_id=' + encodeURIComponent(dev) + '&limit=8') : '?limit=8';
+    var jobs = [fetch('/api/command/status' + listQ).then(function (r) { return r.json(); })];
+    if (activeReqId) {
+      jobs.push(fetch('/api/command/status?request_id=' +
+                      encodeURIComponent(activeReqId))
+        .then(function (r) { return r.json(); }));
+    }
+    Promise.all(jobs).then(function (res) {
+      var cmds = res[0].commands || [];
+      renderRequestList(cmds);
+      // 优先显示正在追踪的那条；否则自动跟最新一条，刷新页面后也能接着看
+      var cur = res[1] && res[1].commands && res[1].commands[0];
+      if (!cur && cmds.length) { cur = cmds[0]; }
+      if (cur) { activeReqId = cur.request_id; renderRequest(cur); }
+    }).catch(function () { /* 指令查询失败不打扰用户，下一轮会自愈 */ });
+  }
+
+  function sendCapture() {
+    var dev = el('deviceSelect').value;
+    if (!dev) {
+      setReqNote('请先选择目标设备：需要开发板至少上报过一次数据，下拉框里才有设备可选。');
+      return;
+    }
+    el('captureBtn').disabled = true;
+    fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: dev, action: 'capture',
+                             sensor: 'camera', ttl_s: 120 })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      el('captureBtn').disabled = false;
+      if (d.error) { setReqNote('下发失败：' + d.error); return; }
+      // 每次点击都拿到一个全新的 request_id —— 连点两次就是两条独立记录
+      activeReqId = d.command.request_id;
+      renderRequest(d.command);
+      refreshRequests();
+    }).catch(function () {
+      el('captureBtn').disabled = false;
+      setReqNote('下发失败：无法连接服务器，请确认服务正在运行。');
+    });
+  }
+
+  el('captureBtn').addEventListener('click', sendCapture);
+  setInterval(refreshRequests, POLL_MS);
+  refreshRequests();
 
   // 摄像头画面：独立于数据轮询，固定读 /api/frame/latest 并加时间戳防缓存
   function refreshCam() {
