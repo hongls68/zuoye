@@ -25,6 +25,7 @@ selftest_command.py —— 第2周「远程采集指令」自测脚本
     5) 重复上传    同一开机内 seq 不递增 → E3 不通过 → FAILED
 """
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -32,9 +33,14 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000").rstrip("/")
-DEVICE = "selftest-device"
-BOOT_ID = "boot-selftest-1"
 TZ = timezone(timedelta(hours=8))
+
+# 每次运行都用一套全新的虚拟设备号与开机标识。
+# 否则同一台服务端上重跑第二次时，E3 会拿上一轮留下的 seq 做比较，
+# 报一堆"seq 未递增"的假失败 —— 这个坑第一次就踩到了。
+RUN_TAG = "%s-%04x" % (datetime.now(TZ).strftime("%H%M%S"), os.getpid() & 0xFFFF)
+DEVICE = "selftest-device-" + RUN_TAG
+BOOT_ID = "boot-selftest-" + RUN_TAG
 
 # 服务端只做「FF D8 开头 / FF D9 结尾」的最简 JPEG 校验，
 # 本脚本关心的是状态机而不是图像解码，所以用一个合成的最小帧即可。
@@ -135,9 +141,11 @@ def scene_1_happy_path():
 
     st, r = poll_command()
     check("设备取走并转 RECEIVED",
-          st == 200 and r["command"] and r["command"]["request_id"] == rid
-          and r["command"]["state"] == "RECEIVED",
-          r["command"]["state_label"] if r["command"] else "无指令")
+          st == 200 and r["command"] and r["command"]["request_id"] == rid,
+          "板端载荷字段: %s" % (sorted(r["command"].keys()) if r["command"] else "无指令"))
+    cmd = status_of(rid)
+    check("服务端状态确为 RECEIVED", cmd and cmd["state"] == "RECEIVED",
+          cmd["state_label"] if cmd else "查不到")
 
     st, r = ack_command(rid)
     check("回执后转 EXECUTING",

@@ -246,6 +246,23 @@ def command_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
+def command_for_device(row: sqlite3.Row) -> dict:
+    """给开发板看的精简载荷。
+
+    刻意不带 state / timeline —— 板子只需要"执行什么"，
+    返回体越小，MCU 侧解析用的内存就越小（ESP32 上这是实打实的约束）。
+    """
+    return {
+        "request_id": row["request_id"],
+        "device_id": row["device_id"],
+        "action": row["action"],
+        "sensor": row["sensor"],
+        "ttl_s": row["ttl_s"],
+        "created_at": row["created_at"],
+        "expires_at": add_seconds(row["created_at"], row["ttl_s"]),
+    }
+
+
 def verify_evidence(conn: sqlite3.Connection, cmd: sqlite3.Row,
                     frame_row: sqlite3.Row) -> tuple:
     """三条证据校验。返回 (是否通过, 不通过原因)。
@@ -658,7 +675,7 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
         print("[%s] 指令 %s 已被 %s 取走"
               % (ts, row["request_id"], device_id), flush=True)
-        self._send_json({"command": command_to_dict(row),
+        self._send_json({"command": command_for_device(row),
                          "server_now": now_iso()})
 
     def _handle_command_ack(self) -> None:
