@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI交互课 第1周 —— 最小传感器数据接收与存储服务
+AI交互课 —— 传感器数据接收与存储服务
 仅使用 Python 标准库，无第三方依赖。
 
-功能：
+【第1周】数据上行链路：
   POST /api/ingest                开发板上传一条传感器记录（JSON）
   GET  /api/latest?device_id=X    查询某设备最新一条记录
   GET  /api/history?device_id=X&limit=N   查询某设备历史记录（新→旧）
@@ -14,6 +14,22 @@ AI交互课 第1周 —— 最小传感器数据接收与存储服务
   GET  /api/health                服务自检
   GET  /                          Web 展示页面（index.html）
 
+【第2周】远程采集指令通道与请求状态机：
+  POST /api/command               网页下发一条采集指令（生成 request_id）
+  GET  /api/command/poll?device_id=X  开发板轮询取指令（取走即置 RECEIVED）
+  POST /api/command/ack           开发板回执（携带 device_ts / boot_id / seq）
+  GET  /api/command/status?request_id=X | ?device_id=X&limit=N   网页查询状态
+  GET  /api/command/frame?request_id=X  取「本次请求」对应的那一帧（非最新帧）
+
+  状态集合：PENDING → RECEIVED → EXECUTING → UPLOADED → COMPLETED
+            分支：EXPIRED（TTL 内无人取）/ TIMEOUT（取了没回传）/ FAILED（设备报错或证据不足）
+
+  ★ 核心原则：UPLOADED ≠ COMPLETED。
+    收到一张图不代表它就是这次要的那张，必须通过三条证据校验才算完成：
+      E1 请求贯穿   request_id 同时出现在 ①指令记录 ②设备回执 ③观测记录
+      E2 时序合理   观测的 capture_ts 必须晚于指令的 dispatched_at
+      E3 新鲜度单调 同一次开机（boot_id）内 seq 必须严格递增
+
 运行：python server.py   （默认监听 0.0.0.0:8000）
 """
 import json
@@ -21,18 +37,37 @@ import os
 import socket
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data.db")
-HTML_PATH = os.path.join(BASE_DIR, "index.html")
-SNAP_DIR = os.path.join(BASE_DIR, "snapshots")  # 摄像头帧存这里
-PORT = 8000
+# 数据目录：默认与脚本同目录；可用环境变量 DATA_DIR 指向别处，
+# 这样 selftest_command.py 能在不污染真实 data.db / snapshots 的前提下跑自测。
+DATA_DIR = os.environ.get("DATA_DIR") or BASE_DIR
+DB_PATH = os.path.join(DATA_DIR, "data.db")
+HTML_PATH = os.path.join(BASE_DIR, "index.html")  # 页面始终取脚本同目录的
+SNAP_DIR = os.path.join(DATA_DIR, "snapshots")    # 摄像头帧存这里
+PORT = int(os.environ.get("PORT") or 8000)  # 可用环境变量 PORT 覆盖，便于本地自测
 TZ = timezone(timedelta(hours=8))  # 东八区，与板端时间口径一致
 MAX_BODY = 64 * 1024               # /api/ingest 的 JSON 上限
 MAX_FRAME = 1 * 1024 * 1024        # /api/frame 的单帧 JPEG 上限（1MB）
+
+# ---- 第2周：指令通道的时间参数 ----
+DEFAULT_TTL_S = 120                # 指令有效期：这么久没人取走 -> EXPIRED
+EXEC_TIMEOUT_S = 120               # 已取走但这么久没回传观测 -> TIMEOUT
+SWEEP_INTERVAL_S = 5               # 后台过期扫描周期（秒）
+
+# 状态集合（与网页状态徽标一一对应，改这里要同步改 index.html）
+ST_PENDING   = "PENDING"    # 指令已创建，等待设备取走
+ST_RECEIVED  = "RECEIVED"   # 设备已取走并回执
+ST_EXECUTING = "EXECUTING"  # 设备正在采集/上传
+ST_UPLOADED  = "UPLOADED"   # 观测已入库（尚未通过证据校验）
+ST_COMPLETED = "COMPLETED"  # 三条证据校验通过
+ST_EXPIRED   = "EXPIRED"    # TTL 内无人取走
+ST_TIMEOUT   = "TIMEOUT"    # 已取走但超时未回传
+ST_FAILED    = "FAILED"     # 设备显式报错，或证据校验不通过
 
 _db_lock = threading.Lock()
 
@@ -92,6 +127,48 @@ def init_db() -> None:
                 bytes     INTEGER
             )"""
         )
+        # 第2周扩展：把「这一帧属于哪次请求」以及证据字段一并记下来，
+        # 否则无法回答本课题眼——「这张图到底是不是这次拍的那张」。
+        frame_cols = {r[1] for r in conn.execute("PRAGMA table_info(frames)")}
+        for col, decl in (("request_id", "TEXT"),   # E1 请求贯穿
+                          ("capture_ts", "TEXT"),   # E2 时序校验
+                          ("boot_id", "TEXT"),      # E3 新鲜度（开机标识）
+                          ("seq", "INTEGER"),       # E3 新鲜度（开机内序号）
+                          ("ts_device", "TEXT")):
+            if col not in frame_cols:
+                conn.execute(f"ALTER TABLE frames ADD COLUMN {col} {decl}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_frames_req ON frames(request_id)"
+        )
+
+        # 第2周：远程采集指令表。一行 = 一次「请求」，全生命周期都在这一行上流转。
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS commands(
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id    TEXT NOT NULL UNIQUE,
+                device_id     TEXT NOT NULL,
+                action        TEXT NOT NULL,
+                sensor        TEXT,
+                state         TEXT NOT NULL,
+                ttl_s         INTEGER NOT NULL,
+                created_at    TEXT NOT NULL,
+                dispatched_at TEXT,
+                ack_at        TEXT,
+                device_ts     TEXT,
+                boot_id       TEXT,
+                seq           INTEGER,
+                capture_ts    TEXT,
+                frame_id      INTEGER,
+                frame_name    TEXT,
+                evidence_ok   INTEGER,
+                fail_reason   TEXT,
+                updated_at    TEXT
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_commands_dev "
+            "ON commands(device_id, id)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -99,6 +176,144 @@ def init_db() -> None:
 
 def row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
+
+
+# ---------------- 第2周：指令通道的公共逻辑 ----------------
+
+# 状态 -> 中文标签，网页直接用，避免前端再维护一份映射
+STATE_LABEL = {
+    ST_PENDING:   "待设备取走",
+    ST_RECEIVED:  "设备已接收",
+    ST_EXECUTING: "设备执行中",
+    ST_UPLOADED:  "观测已入库",
+    ST_COMPLETED: "已完成",
+    ST_EXPIRED:   "已过期（无设备取走）",
+    ST_TIMEOUT:   "已超时（取走未回传）",
+    ST_FAILED:    "失败",
+}
+
+# 终态：落到这些状态就不再被后台扫描改动
+FINAL_STATES = (ST_COMPLETED, ST_EXPIRED, ST_TIMEOUT, ST_FAILED)
+
+
+def new_request_id() -> str:
+    """短、可读、人眼可核对的请求编号，例如 req-20260918-110912-3f7a。
+
+    刻意做成短码：第2周要防的就是「页面拿旧图冒充本次结果」，
+    所以这个编号必须能一眼抄下来核对，而不是一串 UUID。
+    """
+    return "req-%s-%s" % (datetime.now(TZ).strftime("%Y%m%d-%H%M%S"),
+                          os.urandom(2).hex())
+
+
+def add_seconds(iso: str, seconds: int) -> str:
+    """ISO8601 字符串 + N 秒，解析失败时原样返回（不编造时间）。"""
+    try:
+        return (datetime.fromisoformat(iso)
+                + timedelta(seconds=seconds)).isoformat(timespec="milliseconds")
+    except (ValueError, TypeError):
+        return iso
+
+
+def command_timeline(row: sqlite3.Row) -> list:
+    """把一行指令摊成「状态时间线」，页面据此显示卡在哪一步。"""
+    marks = (
+        ("created_at",    ST_PENDING,   "网页下发指令"),
+        ("dispatched_at", ST_RECEIVED,  "设备取走并回执"),
+        ("ack_at",        ST_EXECUTING, "设备开始采集"),
+        ("capture_ts",    ST_UPLOADED,  "观测入库"),
+    )
+    line = []
+    for col, state, note in marks:
+        if row[col]:
+            line.append({"state": state, "label": STATE_LABEL[state],
+                         "at": row[col], "note": note})
+    if row["state"] in FINAL_STATES:
+        line.append({"state": row["state"], "label": STATE_LABEL[row["state"]],
+                     "at": row["updated_at"], "note": row["fail_reason"] or "闭环结束"})
+    return line
+
+
+def command_to_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["state_label"] = STATE_LABEL.get(row["state"], row["state"])
+    d["expires_at"] = add_seconds(row["created_at"], row["ttl_s"])
+    d["is_final"] = row["state"] in FINAL_STATES
+    # 只有「证据齐全」才允许页面展示图像；否则页面必须显示"未完成"，
+    # 绝不能回落到 latest.jpg —— 那正是本课题眼要排除的"旧值冒充"。
+    d["has_frame"] = bool(row["frame_name"]) and row["state"] == ST_COMPLETED
+    d["timeline"] = command_timeline(row)
+    return d
+
+
+def verify_evidence(conn: sqlite3.Connection, cmd: sqlite3.Row,
+                    frame_row: sqlite3.Row) -> tuple:
+    """三条证据校验。返回 (是否通过, 不通过原因)。
+
+    这是整个第2周的核心：UPLOADED 不等于 COMPLETED，
+    收到一张图不代表它就是这次要的那张，必须过这里才允许置 COMPLETED。
+    """
+    # --- E1 请求贯穿：观测必须带着本次的 request_id ---
+    if (frame_row["request_id"] or "") != cmd["request_id"]:
+        return False, "E1 不通过：观测未携带本次 request_id，无法关联到该请求"
+
+    # --- E2 时序合理：采集时刻必须晚于指令下发时刻 ---
+    cap = frame_row["capture_ts"] or ""
+    if cmd["dispatched_at"] and cap and not cap.startswith("uptime+"):
+        if cap <= cmd["dispatched_at"]:
+            return False, ("E2 不通过：capture_ts(%s) 早于指令下发时刻(%s)，"
+                           "疑似把库里的旧图重新提交" % (cap, cmd["dispatched_at"]))
+    # 注：设备未对时时 capture_ts 形如 "uptime+12.345s"，无法与服务器时间比较，
+    # 此时 E2 自动跳过，由 E3 兜底 —— 这正是 boot_id + seq 存在的意义。
+
+    # --- E3 新鲜度单调：同一次开机内 seq 必须严格递增 ---
+    boot = frame_row["boot_id"] or ""
+    seq = frame_row["seq"]
+    if boot and seq is not None:
+        prev = conn.execute(
+            "SELECT MAX(seq) AS m FROM frames "
+            "WHERE device_id=? AND boot_id=? AND id<?",
+            (cmd["device_id"], boot, frame_row["id"]),
+        ).fetchone()
+        prev_seq = prev["m"] if prev else None
+        if prev_seq is not None and seq <= prev_seq:
+            return False, ("E3 不通过：seq=%d 未超过同一开机的上一条 seq=%d，"
+                           "疑似把同一帧重复上传冒充新拍" % (seq, prev_seq))
+    return True, ""
+
+
+def sweep_commands(conn: sqlite3.Connection) -> int:
+    """把卡住的指令推进到 EXPIRED / TIMEOUT。返回本次改动的条数。
+
+    PENDING 超时 -> EXPIRED（没人取）；RECEIVED/EXECUTING 超时 -> TIMEOUT（取了没回传）。
+    注意：超时只说明「这次没拿到结果」，不等于硬件故障 —— 所以绝不写 FAILED。
+    """
+    now = datetime.now(TZ)
+    changed = 0
+    rows = conn.execute(
+        "SELECT * FROM commands WHERE state IN (?,?,?)",
+        (ST_PENDING, ST_RECEIVED, ST_EXECUTING),
+    ).fetchall()
+    for r in rows:
+        if r["state"] == ST_PENDING:
+            base, limit, nxt = r["created_at"], r["ttl_s"], ST_EXPIRED
+        else:
+            base = r["dispatched_at"] or r["created_at"]
+            limit, nxt = EXEC_TIMEOUT_S, ST_TIMEOUT
+        try:
+            age = (now - datetime.fromisoformat(base)).total_seconds()
+        except (ValueError, TypeError):
+            continue
+        if age > limit:
+            conn.execute(
+                "UPDATE commands SET state=?, updated_at=?, fail_reason=? WHERE id=?",
+                (nxt, now_iso(), "%s：等待超过 %d 秒" % (STATE_LABEL[nxt], limit),
+                 r["id"]),
+            )
+            changed += 1
+    if changed:
+        conn.commit()
+    return changed
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -130,6 +345,42 @@ class Handler(BaseHTTPRequestHandler):
     def _query(self) -> dict:
         return parse_qs(urlparse(self.path).query)
 
+    def _read_json_body(self):
+        """读并解析 JSON 请求体。任何一步失败都自行回包并返回 None。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_BODY:
+            self._send_json({"error": "请求体长度非法"}, 400)
+            return None
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json({"error": "JSON 解析失败"}, 400)
+            return None
+        if not isinstance(data, dict):
+            self._send_json({"error": "请求体必须是 JSON 对象"}, 400)
+            return None
+        return data
+
+    def _send_image_file(self, path: str) -> None:
+        """把磁盘上的一张 JPEG 原样回给浏览器（<img> 直接引用）。"""
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._send_json({"error": "读取图像失败"}, 500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        # 请求级图像内容不会变，但仍禁用缓存，避免课堂上"换了图没变"的误会
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, fmt, *args):  # 精简日志
         print("[%s] %s" % (now_iso(), fmt % args), flush=True)
 
@@ -149,6 +400,12 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_devices()
         elif path == "/api/frame/latest":
             self._handle_frame_image()
+        elif path == "/api/command/poll":
+            self._handle_command_poll(q)
+        elif path == "/api/command/status":
+            self._handle_command_status(q)
+        elif path == "/api/command/frame":
+            self._handle_command_frame(q)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -216,7 +473,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 摄像头帧 ----------
     def _handle_frame(self) -> None:
-        """开发板 POST 一帧 JPEG（二进制 body，自定义头携带设备编号与板端时间）"""
+        """开发板 POST 一帧 JPEG（二进制 body，自定义头携带设备编号与板端时间）
+
+        第2周新增四个请求头，用于把这一帧和「某一次请求」绑起来：
+          X-Request-Id  本次所属请求（命令触发时必填，E1 请求贯穿）
+          X-Capture-Ts  采集时刻（E2 时序校验）
+          X-Boot-Id     本次开机标识（E3 新鲜度校验）
+          X-Seq         开机内递增序号（E3 新鲜度校验）
+        周期性抓拍不带 X-Request-Id，只入库、不参与命令闭环。
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -230,6 +495,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "收到的不是 JPEG 数据"}, 400)
             return
         device_id = (self.headers.get("X-Device-Id") or "").strip()
+        request_id = (self.headers.get("X-Request-Id") or "").strip()
+        capture_ts = (self.headers.get("X-Capture-Ts") or "").strip()
+        boot_id = (self.headers.get("X-Boot-Id") or "").strip()
+        ts_device = (self.headers.get("X-Ts-Device") or "").strip()
+        try:
+            seq = int(self.headers.get("X-Seq") or "")
+        except ValueError:
+            seq = None
         ts = now_iso()
         try:
             fname = save_frame(data, ts)
@@ -240,15 +513,64 @@ class Handler(BaseHTTPRequestHandler):
             conn = get_db()
             try:
                 cur = conn.execute(
-                    "INSERT INTO frames(device_id, ts_server, filename, bytes) "
-                    "VALUES(?,?,?,?)",
-                    (device_id or None, ts, fname, len(data)),
+                    "INSERT INTO frames(device_id, ts_server, filename, bytes, "
+                    "request_id, capture_ts, boot_id, seq, ts_device) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (device_id or None, ts, fname, len(data),
+                     request_id or None, capture_ts or None,
+                     boot_id or None, seq, ts_device or None),
+                )
+                conn.commit()
+                frame_id = cur.lastrowid
+            finally:
+                conn.close()
+
+        # 命令触发的帧：立刻走证据校验，决定是 UPLOADED 还是 COMPLETED / FAILED
+        verdict = None
+        if request_id:
+            verdict = self._link_command_frame(request_id, frame_id)
+
+        self._send_json({"ok": True, "bytes": len(data),
+                         "device_id": device_id, "ts_server": ts,
+                         "request_id": request_id or None,
+                         "evidence": verdict}, 201)
+
+    def _link_command_frame(self, request_id: str, frame_id: int):
+        """把刚入库的这一帧关联到指令上，并做三条证据校验。
+
+        返回校验结论，随 /api/frame 的响应一起回给开发板 ——
+        这样串口日志里能直接看到「这次到底算不算成功、不成功是差哪条证据」。
+        """
+        ts = now_iso()
+        with _db_lock:
+            conn = get_db()
+            try:
+                cmd = conn.execute("SELECT * FROM commands WHERE request_id=?",
+                                   (request_id,)).fetchone()
+                if cmd is None:
+                    return {"ok": False, "reason": "未知的 request_id"}
+                if cmd["state"] in FINAL_STATES:
+                    return {"ok": False, "state": cmd["state"],
+                            "reason": "指令已处于终态，本次观测仅入库"}
+                frame = conn.execute("SELECT * FROM frames WHERE id=?",
+                                     (frame_id,)).fetchone()
+                ok, reason = verify_evidence(conn, cmd, frame)
+                new_state = ST_COMPLETED if ok else ST_FAILED
+                conn.execute(
+                    "UPDATE commands SET state=?, frame_id=?, frame_name=?, "
+                    "capture_ts=?, evidence_ok=?, fail_reason=?, updated_at=? "
+                    "WHERE id=?",
+                    (new_state, frame_id, frame["filename"],
+                     frame["capture_ts"] or ts, 1 if ok else 0,
+                     None if ok else reason, ts, cmd["id"]),
                 )
                 conn.commit()
             finally:
                 conn.close()
-        self._send_json({"ok": True, "bytes": len(data),
-                         "device_id": device_id, "ts_server": ts}, 201)
+        print("[%s] 观测入库并校验 %s -> %s%s"
+              % (ts, request_id, new_state, "" if ok else "（%s）" % reason),
+              flush=True)
+        return {"ok": ok, "state": new_state, "reason": None if ok else reason}
 
     def _handle_frame_image(self) -> None:
         """返回最新一帧 JPEG，供网页 <img> 实时刷新显示"""
@@ -256,24 +578,210 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.exists(latest):
             self._send_json({"error": "暂无图像，等待开发板上传"}, 404)
             return
-        try:
-            with open(latest, "rb") as f:
-                body = f.read()
-        except OSError:
-            self._send_json({"error": "读取图像失败"}, 500)
+        self._send_image_file(latest)
+
+    # ---------- 第2周：远程采集指令 ----------
+    def _handle_command_create(self) -> None:
+        """网页下发一条采集指令。
+
+        每次点击都生成独立的 request_id —— 重复点击不会被合并成一条，
+        否则「两次点击共用一条记录」会让状态互相覆盖，追踪就失效了。
+        """
+        data = self._read_json_body()
+        if data is None:
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        device_id = str(data.get("device_id") or "").strip()
+        if not device_id:
+            self._send_json({"error": "device_id 为必填字段"}, 400)
+            return
+        action = str(data.get("action") or "capture").strip()
+        sensor = str(data.get("sensor") or "camera").strip()
+        try:
+            ttl = int(data.get("ttl_s") or DEFAULT_TTL_S)
+        except (TypeError, ValueError):
+            ttl = DEFAULT_TTL_S
+        ttl = max(5, min(3600, ttl))
+
+        request_id = new_request_id()
+        ts = now_iso()
+        with _db_lock:
+            conn = get_db()
+            try:
+                cur = conn.execute(
+                    "INSERT INTO commands(request_id, device_id, action, sensor, "
+                    "state, ttl_s, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (request_id, device_id, action, sensor,
+                     ST_PENDING, ttl, ts, ts),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM commands WHERE id=?",
+                                   (cur.lastrowid,)).fetchone()
+            finally:
+                conn.close()
+        print("[%s] 已下发指令 %s -> %s（TTL %d 秒）"
+              % (ts, request_id, device_id, ttl), flush=True)
+        self._send_json({"ok": True, "command": command_to_dict(row)}, 201)
+
+    def _handle_command_poll(self, q: dict) -> None:
+        """开发板轮询取指令。
+
+        取走即置 RECEIVED 并记下 dispatched_at —— 这是「设备已接收」
+        这个状态唯一的证据来源，没有它就只能说"已下发，不知道设备收没收到"。
+        """
+        device_id = (q.get("device_id") or [""])[0].strip()
+        if not device_id:
+            self._send_json({"error": "device_id 为必填参数"}, 400)
+            return
+        with _db_lock:
+            conn = get_db()
+            try:
+                sweep_commands(conn)
+                row = conn.execute(
+                    "SELECT * FROM commands WHERE device_id=? AND state=? "
+                    "ORDER BY id ASC LIMIT 1",
+                    (device_id, ST_PENDING),
+                ).fetchone()
+                if row is None:
+                    self._send_json({"command": None, "server_now": now_iso()})
+                    return
+                ts = now_iso()
+                conn.execute(
+                    "UPDATE commands SET state=?, dispatched_at=?, updated_at=? "
+                    "WHERE id=?",
+                    (ST_RECEIVED, ts, ts, row["id"]),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM commands WHERE id=?",
+                                   (row["id"],)).fetchone()
+            finally:
+                conn.close()
+        print("[%s] 指令 %s 已被 %s 取走"
+              % (ts, row["request_id"], device_id), flush=True)
+        self._send_json({"command": command_to_dict(row),
+                         "server_now": now_iso()})
+
+    def _handle_command_ack(self) -> None:
+        """开发板回执。携带板端时间、开机标识与序号，供 E2 / E3 校验。"""
+        data = self._read_json_body()
+        if data is None:
+            return
+        request_id = str(data.get("request_id") or "").strip()
+        if not request_id:
+            self._send_json({"error": "request_id 为必填字段"}, 400)
+            return
+        state = str(data.get("state") or ST_EXECUTING).strip()
+        if state not in (ST_EXECUTING, ST_FAILED):
+            state = ST_EXECUTING
+        seq = data.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            seq = None
+
+        with _db_lock:
+            conn = get_db()
+            try:
+                row = conn.execute("SELECT * FROM commands WHERE request_id=?",
+                                   (request_id,)).fetchone()
+                if row is None:
+                    self._send_json({"error": "未知的 request_id"}, 404)
+                    return
+                # 幂等：终态指令被重复回执时不改状态，只回报当前状态
+                if row["state"] in FINAL_STATES:
+                    self._send_json({"ok": True, "idempotent": True,
+                                     "command": command_to_dict(row)})
+                    return
+                ts = now_iso()
+                conn.execute(
+                    "UPDATE commands SET state=?, ack_at=?, device_ts=?, "
+                    "boot_id=?, seq=?, fail_reason=?, updated_at=? WHERE id=?",
+                    (state, ts,
+                     str(data.get("device_ts") or ""),
+                     str(data.get("boot_id") or ""),
+                     seq,
+                     (str(data.get("reason") or "") or "设备显式报错")
+                     if state == ST_FAILED else None,
+                     ts, row["id"]),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM commands WHERE id=?",
+                                   (row["id"],)).fetchone()
+            finally:
+                conn.close()
+        print("[%s] 收到回执 %s（state=%s, boot_id=%s, seq=%s）"
+              % (ts, request_id, row["state"], row["boot_id"], row["seq"]),
+              flush=True)
+        self._send_json({"ok": True, "command": command_to_dict(row)})
+
+    def _handle_command_status(self, q: dict) -> None:
+        """网页查询指令状态。页面每秒轮询这里，状态时间线也来自这里。"""
+        request_id = (q.get("request_id") or [""])[0].strip()
+        device_id = (q.get("device_id") or [""])[0].strip()
+        try:
+            limit = max(1, min(50, int((q.get("limit") or ["10"])[0])))
+        except ValueError:
+            limit = 10
+        with _db_lock:
+            conn = get_db()
+            try:
+                sweep_commands(conn)
+                if request_id:
+                    rows = conn.execute(
+                        "SELECT * FROM commands WHERE request_id=?",
+                        (request_id,)).fetchall()
+                elif device_id:
+                    rows = conn.execute(
+                        "SELECT * FROM commands WHERE device_id=? "
+                        "ORDER BY id DESC LIMIT ?",
+                        (device_id, limit)).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM commands ORDER BY id DESC LIMIT ?",
+                        (limit,)).fetchall()
+            finally:
+                conn.close()
+        self._send_json({"commands": [command_to_dict(r) for r in rows],
+                         "server_now": now_iso()})
+
+    def _handle_command_frame(self, q: dict) -> None:
+        """取「本次请求」对应的那一帧，而不是"最新一帧"。
+
+        ★ 刻意不做「取不到就回落到 latest.jpg」——
+        那正是本课题眼要排除的旧值冒充。请求没完成就返回 404，
+        页面据此显示"未完成"，绝不允许拿库里的旧图顶上。
+        """
+        request_id = (q.get("request_id") or [""])[0].strip()
+        if not request_id:
+            self._send_json({"error": "request_id 为必填参数"}, 400)
+            return
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT * FROM commands WHERE request_id=?",
+                               (request_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            self._send_json({"error": "未知的 request_id"}, 404)
+            return
+        if row["state"] != ST_COMPLETED or not row["frame_name"]:
+            self._send_json(
+                {"error": "本次请求尚未完成，无可用图像",
+                 "state": row["state"],
+                 "state_label": STATE_LABEL.get(row["state"], row["state"])},
+                404)
+            return
+        self._send_image_file(os.path.join(SNAP_DIR, row["frame_name"]))
 
     # ---------- POST ----------
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/api/frame":
             self._handle_frame()
+            return
+        if path == "/api/command":
+            self._handle_command_create()
+            return
+        if path == "/api/command/ack":
+            self._handle_command_ack()
             return
         if path != "/api/ingest":
             self._send_json({"error": "not found"}, 404)
@@ -369,8 +877,31 @@ def save_frame(data: bytes, ts: str) -> str:
     return fname
 
 
+def command_sweeper() -> None:
+    """后台把卡住的指令推进到 EXPIRED / TIMEOUT。
+
+    页面轮询时也会顺手扫一次，但后台线程保证「没人看页面」时状态机依然自洽 ——
+    比如设备关机后下发、页面又关掉了，指令仍会在 TTL 到点后转 EXPIRED。
+    """
+    while True:
+        time.sleep(SWEEP_INTERVAL_S)
+        try:
+            with _db_lock:
+                conn = get_db()
+                try:
+                    n = sweep_commands(conn)
+                finally:
+                    conn.close()
+            if n:
+                print("[%s] 后台扫描：%d 条指令超时（转 EXPIRED / TIMEOUT）"
+                      % (now_iso(), n), flush=True)
+        except Exception as e:      # 后台线程绝不能因异常退出
+            print("[%s] 后台扫描异常: %s" % (now_iso(), e), flush=True)
+
+
 def main() -> None:
     init_db()
+    threading.Thread(target=command_sweeper, daemon=True).start()
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         lan = socket.gethostbyname(socket.gethostname())
@@ -381,6 +912,8 @@ def main() -> None:
     print("  本机访问:  http://127.0.0.1:%d/" % PORT, flush=True)
     print("  局域网访问: http://%s:%d/  ← 填到开发板固件里" % (lan, PORT),
           flush=True)
+    print("  指令通道:  POST /api/command | GET /api/command/poll"
+          " | POST /api/command/ack | GET /api/command/status", flush=True)
     print("=" * 60, flush=True)
     httpd.serve_forever()
 
