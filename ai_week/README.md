@@ -7,7 +7,7 @@
 ## 一、项目结构
 
 ```
-ai-week1/
+ai_week/
 ├── README.md                  ← 本文件（部署入口 + 运行说明 + 排错）
 ├── server/                    ← 服务端（跑在你自己的电脑上，替代 VPS）
 │   ├── server.py              ← 接收、存储、查询接口，纯 Python 标准库无依赖
@@ -69,7 +69,7 @@ ai-week1/
 ### 第 1 步：启动服务端（你的电脑当服务器）
 
 ```powershell
-cd D:\zuoye\ai-week1\server
+cd D:\zuoye\ai_week\server
 python server.py
 ```
 
@@ -120,7 +120,7 @@ python server.py
 
 ```powershell
 # 打开 ESP-IDF 命令行（开始菜单搜 "ESP-IDF 5.5 PowerShell"）
-cd D:\zuoye\ai-week1\firmware
+cd D:\zuoye\ai_week\firmware
 
 idf.py set-target esp32s3      # 仅首次需要
 idf.py build                   # 编译

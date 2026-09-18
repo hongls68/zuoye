@@ -48,7 +48,7 @@ run_idf.py —— 在受限 shell（Git Bash / MSYS2 / 沙箱）中驱动 ESP-ID
 
 用法
 ----
-    cd D:/qianwen/ai-week1/firmware
+    cd D:/zuoye/ai_week/firmware
     python ../tools/run_idf.py build
     python ../tools/run_idf.py -p COM4 flash
     python ../tools/run_idf.py -p COM4 monitor

@@ -339,7 +339,7 @@ setInterval(refreshCam, 1500); refreshCam();
 
 ```powershell
 # 在 ESP-IDF 5.5 PowerShell 中
-cd D:\zuoye\ai-week1\firmware
+cd D:\zuoye\ai_week\firmware
 idf.py build                 # 首次会自动下载 esp32-camera 组件
 idf.py -p COM4 flash
 idf.py -p COM4 monitor       # 应看到 "摄像头初始化成功" 与周期性 "抓取一帧 N bytes，上传中"
