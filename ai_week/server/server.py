@@ -20,6 +20,11 @@ AI交互课 —— 传感器数据接收与存储服务
   POST /api/command/ack           开发板回执（携带 device_ts / boot_id / seq）
   GET  /api/command/status?request_id=X | ?device_id=X&limit=N   网页查询状态
   GET  /api/command/frame?request_id=X  取「本次请求」对应的那一帧（非最新帧）
+  GET  /api/frames?device_id=X&limit=N  照片画廊元数据（含 sha256 / 尺寸 / 来源 / 是否已清理）
+  GET  /api/frames/image?id=N           按帧 id 取原图（已清理的帧回 404 + 哈希）
+
+  数据保留（计划书 4.5）：**元数据（含 SHA-256）永久保留，原图按 RETENTION_DAYS 清理**。
+  清掉的是文件，不是证据 —— 画廊里仍能看到这一条的哈希与拍摄时间。
 
   状态集合：PENDING → RECEIVED → EXECUTING → UPLOADED → COMPLETED
             分支：EXPIRED（TTL 内无人取）/ TIMEOUT（取了没回传）/ FAILED（设备报错或证据不足）
@@ -32,6 +37,7 @@ AI交互课 —— 传感器数据接收与存储服务
 
 运行：python server.py   （默认监听 0.0.0.0:8000）
 """
+import hashlib
 import json
 import os
 import socket
@@ -58,6 +64,13 @@ MAX_FRAME = 1 * 1024 * 1024        # /api/frame 的单帧 JPEG 上限（1MB）
 DEFAULT_TTL_S = 120                # 指令有效期：这么久没人取走 -> EXPIRED
 EXEC_TIMEOUT_S = 120               # 已取走但这么久没回传观测 -> TIMEOUT
 SWEEP_INTERVAL_S = 5               # 后台过期扫描周期（秒）
+
+# ---- 第2周：数据保留与配额（对应计划书 4.5）----
+# 规则：**元数据（含哈希）永久保留，原图按配额清理**。
+# 理由：哈希能证明"这张图当时确实是这个内容"，是可追溯性的根；
+#       原图只占存储，开发期留 7 天足够复现与演示。
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or 7)
+PURGE_INTERVAL_S = 300             # 后台清理扫描周期（秒）
 
 # 状态集合（与网页状态徽标一一对应，改这里要同步改 index.html）
 ST_PENDING   = "PENDING"    # 指令已创建，等待设备取走
@@ -137,7 +150,14 @@ def init_db() -> None:
                           ("capture_ts", "TEXT"),   # E2 时序校验
                           ("boot_id", "TEXT"),      # E3 新鲜度（开机标识）
                           ("seq", "INTEGER"),       # E3 新鲜度（开机内序号）
-                          ("ts_device", "TEXT")):
+                          ("ts_device", "TEXT"),
+                          # 下面几列服务于「照片画廊 + 完整性检验 + 配额清理」
+                          ("sha256", "TEXT"),       # 原图内容的 SHA-256
+                          ("size_bytes", "INTEGER"),# 原图字节数
+                          ("width", "INTEGER"),     # 从 JPEG 头解析出的宽
+                          ("height", "INTEGER"),    # 从 JPEG 头解析出的高
+                          ("source", "TEXT"),       # 来源：web_manual / periodic / unknown
+                          ("purged_at", "TEXT")):   # 原图被清理的时刻（NULL=原图还在）
             if col not in frame_cols:
                 conn.execute(f"ALTER TABLE frames ADD COLUMN {col} {decl}")
         conn.execute(
@@ -435,6 +455,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_devices()
         elif path == "/api/frame/latest":
             self._handle_frame_image()
+        elif path == "/api/frames":
+            self._handle_gallery(q)
+        elif path == "/api/frames/image":
+            self._handle_frame_image_by_id(q)
         elif path == "/api/command/poll":
             self._handle_command_poll(q)
         elif path == "/api/command/status":
@@ -544,16 +568,25 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             self._send_json({"error": "保存图像失败: %s" % e}, 500)
             return
+        # 画廊要用的派生信息：哈希（永久留痕）、字节数、分辨率、来源。
+        digest = sha256_hex(data)
+        width, height = jpeg_size(data)
+        source = (self.headers.get("X-Source") or "").strip()
+        if not source:
+            # 没显式声明就按有无 request_id 推断：带 request_id 一定是网页点出来的。
+            source = "web_manual" if request_id else "periodic"
         with _db_lock:
             conn = get_db()
             try:
                 cur = conn.execute(
                     "INSERT INTO frames(device_id, ts_server, filename, bytes, "
-                    "request_id, capture_ts, boot_id, seq, ts_device) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    "request_id, capture_ts, boot_id, seq, ts_device, "
+                    "sha256, size_bytes, width, height, source) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (device_id or None, ts, fname, len(data),
                      request_id or None, capture_ts or None,
-                     boot_id or None, seq, ts_device or None),
+                     boot_id or None, seq, ts_device or None,
+                     digest, len(data), width, height, source),
                 )
                 conn.commit()
                 frame_id = cur.lastrowid
@@ -567,6 +600,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_json({"ok": True, "bytes": len(data),
                          "device_id": device_id, "ts_server": ts,
+                         "sha256": digest, "width": width, "height": height,
                          "request_id": request_id or None,
                          "evidence": verdict}, 201)
 
@@ -614,6 +648,91 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "暂无图像，等待开发板上传"}, 404)
             return
         self._send_image_file(latest)
+
+    # ---------- 第2周：照片画廊（元数据永久保留，原图按配额清理） ----------
+    def _handle_gallery(self, q: dict) -> None:
+        """画廊数据源：按时间倒序列出帧元数据（含哈希、是否已按配额清理）。
+
+        对应计划书 4.5 —— 原图可能被清掉，但这一行永远在，
+        所以画廊里「已清理」的卡片仍然带着 sha256 与拍摄时间，依旧可追溯。
+        """
+        device_id = (q.get("device_id") or [""])[0]
+        try:
+            limit = int((q.get("limit") or ["60"])[0])
+        except ValueError:
+            limit = 60
+        limit = max(1, min(500, limit))
+        conn = get_db()
+        try:
+            sql = ("SELECT f.*, c.state AS command_state FROM frames f "
+                   "LEFT JOIN commands c ON c.request_id = f.request_id")
+            args = []
+            if device_id:
+                sql += " WHERE f.device_id=?"
+                args.append(device_id)
+            sql += " ORDER BY f.id DESC LIMIT ?"
+            args.append(limit)
+            items = []
+            for r in conn.execute(sql, args).fetchall():
+                items.append({
+                    "id": r["id"],
+                    "device_id": r["device_id"],
+                    "ts_server": r["ts_server"],
+                    "capture_ts": r["capture_ts"],
+                    "request_id": r["request_id"],
+                    "command_state": r["command_state"],
+                    "source": r["source"] or "unknown",
+                    "bytes": r["size_bytes"] if r["size_bytes"] is not None else r["bytes"],
+                    "width": r["width"] or 0,
+                    "height": r["height"] or 0,
+                    "sha256": r["sha256"],
+                    "purged": bool(r["purged_at"]),
+                    "purged_at": r["purged_at"],
+                })
+            stat = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN purged_at IS NULL THEN 1 ELSE 0 END) AS kept, "
+                "SUM(CASE WHEN purged_at IS NULL "
+                "         THEN COALESCE(size_bytes, bytes, 0) ELSE 0 END) AS kept_bytes "
+                "FROM frames"
+            ).fetchone()
+            total = stat["total"] or 0
+            kept = stat["kept"] or 0
+            self._send_json({
+                "frames": items,
+                "storage": {"total": total, "kept": kept, "purged": total - kept,
+                            "kept_bytes": stat["kept_bytes"] or 0,
+                            "retention_days": RETENTION_DAYS},
+                "server_now": now_iso(),
+            })
+        finally:
+            conn.close()
+
+    def _handle_frame_image_by_id(self, q: dict) -> None:
+        """按帧 id 取原图。已被配额清理的帧明确回 404 + 哈希，而不是含糊的 500。"""
+        try:
+            fid = int((q.get("id") or [""])[0])
+        except ValueError:
+            self._send_json({"error": "id 必须是整数"}, 400)
+            return
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT * FROM frames WHERE id=?", (fid,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            self._send_json({"error": "没有这一帧"}, 404)
+            return
+        if row["purged_at"]:
+            self._send_json({"error": "该帧原图已按配额清理",
+                             "sha256": row["sha256"],
+                             "purged_at": row["purged_at"]}, 404)
+            return
+        path = guard_snapshot_path(row["filename"])
+        if not path or not os.path.exists(path):
+            self._send_json({"error": "原图文件缺失", "sha256": row["sha256"]}, 404)
+            return
+        self._send_image_file(path)
 
     # ---------- 第2周：远程采集指令 ----------
     def _handle_command_create(self) -> None:
@@ -897,6 +1016,55 @@ class Handler(BaseHTTPRequestHandler):
                          "ts_server": record["ts_server"]}, 201)
 
 
+def sha256_hex(data: bytes) -> str:
+    """整帧内容的 SHA-256。
+
+    原图会被配额清掉，但哈希永久留在库里，用来回答「当时那张图到底是什么」。
+    这是计划书 4.5 里点名的加分项：**图片可以过期，证据不可以过期**。
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
+def jpeg_size(data: bytes) -> tuple:
+    """从 JPEG 字节流里解析出 (width, height)，解析不出就返回 (0, 0)。
+
+    只认 SOF0~SOF3 / SOF5~SOF7 / SOF9~SOF11 这些帧头段，跳过 DHT/DQT/APPn 等无关段。
+    画廊里拿它显示「分辨率」，解析失败显示成「—」，不影响入库。
+    """
+    if len(data) < 4 or data[0:2] != b"\xff\xd8":
+        return (0, 0)
+    i, n = 2, len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:   # 无载荷段
+            i += 2
+            continue
+        if marker == 0xD9:                                     # EOI，后面没头了
+            break
+        seg_len = (data[i + 2] << 8) | data[i + 3]
+        if seg_len < 2:
+            break
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3,
+                      0xC5, 0xC6, 0xC7,
+                      0xC9, 0xCA, 0xCB):
+            h = (data[i + 5] << 8) | data[i + 6]    # 段内：精度1 + 高2 + 宽2
+            w = (data[i + 7] << 8) | data[i + 8]
+            return (w, h)
+        i += 2 + seg_len
+    return (0, 0)
+
+
+def guard_snapshot_path(name: str) -> str:
+    """把客户端给的文件名收敛到 snapshots/ 之内，挡掉 ../ 之类的目录穿越。"""
+    base = os.path.basename((name or "").strip())
+    if not base or base.startswith("."):
+        return ""
+    return os.path.join(SNAP_DIR, base)
+
+
 def save_frame(data: bytes, ts: str) -> str:
     """把一帧 JPEG 存入 snapshots/：按时间戳命名归档，并覆盖 latest.jpg 供实时显示。"""
     os.makedirs(SNAP_DIR, exist_ok=True)
@@ -910,6 +1078,57 @@ def save_frame(data: bytes, ts: str) -> str:
     with open(latest, "wb") as f:   # 覆盖式写入，网页固定读这一个文件
         f.write(data)
     return fname
+
+
+def purge_expired_frames(conn) -> int:
+    """按配额清理过期原图：删文件、置 purged_at，**元数据与哈希原样保留**。
+
+    对应计划书 4.5「元数据永久留、原图按天清」：
+    清完之后 /api/frames 仍能列出这一条（标成已清理），sha256 永远在，
+    因此仍然能证明「当时的图是什么内容」——只是不再占存储。
+    """
+    cutoff = (datetime.now(TZ) - timedelta(days=RETENTION_DAYS)).isoformat()
+    rows = conn.execute(
+        "SELECT id, filename FROM frames "
+        "WHERE purged_at IS NULL AND ts_server < ?", (cutoff,)
+    ).fetchall()
+    n = 0
+    for row in rows:
+        path = guard_snapshot_path(row["filename"])
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as e:
+                # 只在「文件确实还在」时才算失败：某些环境删完才抛错（如回收站不可用），
+                # 那种情况下文件已经没了，不该拖住 purged_at 的标记。
+                if os.path.exists(path):
+                    print("[%s] 清理原图失败，下轮重试: %s (%s)"
+                          % (now_iso(), row["filename"], e), flush=True)
+                    continue
+        conn.execute("UPDATE frames SET purged_at = ? WHERE id = ?",
+                     (now_iso(), row["id"]))
+        n += 1
+    if n:
+        conn.commit()
+    return n
+
+
+def frame_purger() -> None:
+    """后台配额清理线程：每 PURGE_INTERVAL_S 扫一次，把超期原图收走。"""
+    while True:
+        time.sleep(PURGE_INTERVAL_S)
+        try:
+            with _db_lock:
+                conn = get_db()
+                try:
+                    n = purge_expired_frames(conn)
+                finally:
+                    conn.close()
+            if n:
+                print("[%s] 配额清理：%d 张原图超期（>%d 天）已清，元数据与哈希保留"
+                      % (now_iso(), n, RETENTION_DAYS), flush=True)
+        except Exception as e:      # 后台线程绝不能因异常退出
+            print("[%s] 配额清理异常: %s" % (now_iso(), e), flush=True)
 
 
 def command_sweeper() -> None:
@@ -937,6 +1156,7 @@ def command_sweeper() -> None:
 def main() -> None:
     init_db()
     threading.Thread(target=command_sweeper, daemon=True).start()
+    threading.Thread(target=frame_purger, daemon=True).start()
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         lan = socket.gethostbyname(socket.gethostname())
