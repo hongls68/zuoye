@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 620" width="900" height="620" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+  <rect width="900" height="620" fill="#ffffff"/>
+  <text x="30" y="36" font-size="19" font-weight="700" fill="#0f172a">载板（Carrier PCB）布局图 · 1:1</text>
+  <text x="30" y="57" font-size="12" fill="#64748b">74.0 × 54.0 mm　·　2 层板　·　1.6 mm 厚　·　**不重画主控**：核心板直接用现成模块，载板只做电源与扩展</text>
+
+  <!-- ============ 板框 ============ -->
+  <g transform="translate(0,0)">
+    <rect x="170" y="110" width="518" height="378" rx="10" fill="#f0fdf4" stroke="#166534" stroke-width="2.2"/>
+    <text x="182" y="130" font-size="11" fill="#166534">载板 FR-4 1.6t · 绿油 · 沉金</text>
+
+    <!-- 四角安装孔 -->
+    <g fill="#ffffff" stroke="#166534" stroke-width="1.5">
+      <circle cx="200" cy="142" r="8"/><circle cx="658" cy="142" r="8"/>
+      <circle cx="200" cy="456" r="8"/><circle cx="658" cy="456" r="8"/>
+    </g>
+    <text x="212" y="146" font-size="9.5" fill="#166534">Ø3.2 ×4</text>
+
+    <!-- ===== 电源区 ===== -->
+    <rect x="188" y="170" width="106" height="118" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.4" stroke-dasharray="5 3"/>
+    <text x="196" y="188" font-size="10" fill="#065f46">电源区</text>
+
+    <!-- USB-C 输入（左边缘） -->
+    <rect x="170" y="196" width="26" height="52" rx="4" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="196" y="214" font-size="9.5" fill="#334155">USB-C</text>
+    <text x="196" y="228" font-size="9.5" fill="#334155">5V 输入</text>
+
+    <!-- 电源开关 -->
+    <rect x="212" y="196" width="72" height="26" rx="4" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="218" y="213" font-size="9.5" fill="#334155">电源开关 SS-12D00</text>
+
+    <!-- 充电管理 -->
+    <rect x="212" y="234" width="72" height="46" rx="4" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="218" y="250" font-size="9.5" fill="#334155">TP4056</text>
+    <text x="218" y="264" font-size="9.5" fill="#334155">充电管理</text>
+
+    <!-- 电池接口 -->
+    <rect x="212" y="290" width="72" height="30" rx="4" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="218" y="309" font-size="9.5" fill="#334155">JST-PH 2P 电池</text>
+
+    <!-- 反接保护 + 保险 -->
+    <rect x="188" y="330" width="106" height="34" rx="4" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="196" y="351" font-size="9.5" fill="#334155">SS34 反接保护 + 自恢复保险 1A</text>
+
+    <!-- ===== 排母：对接核心板 ===== -->
+    <rect x="320" y="180" width="330" height="26" rx="4" fill="#fef3c7" stroke="#b45309" stroke-width="1.6"/>
+    <text x="330" y="197" font-size="10" fill="#78350f">排母 1×20P（对接主板 ESP32-S3-EYE-MB）</text>
+
+    <rect x="320" y="392" width="330" height="26" rx="4" fill="#fef3c7" stroke="#b45309" stroke-width="1.6"/>
+    <text x="330" y="409" font-size="10" fill="#78350f">排母 1×20P（对接子板 ESP32-S3-EYE-SUB）</text>
+
+    <!-- 中间走线区 -->
+    <rect x="320" y="228" width="330" height="142" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-width="1" stroke-dasharray="6 4"/>
+    <text x="334" y="250" font-size="10" fill="#64748b">中间走线区（核心板正下方，禁止放高元件）</text>
+    <g stroke="#94a3b8" stroke-width="1">
+      <line x1="330" y1="290" x2="640" y2="290"/><line x1="330" y1="310" x2="640" y2="310"/>
+      <line x1="330" y1="330" x2="640" y2="330"/>
+    </g>
+    <text x="334" y="356" font-size="10" fill="#64748b">走线：3V3 / 5V / GND / SDA / SCL / UART_TX / UART_RX</text>
+
+    <!-- ===== 扩展区 ===== -->
+    <rect x="660" y="180" width="28" height="86" rx="4" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.4"/>
+    <text x="692" y="200" font-size="9.5" fill="#1e3a8a">端子台 4P</text>
+    <text x="692" y="214" font-size="9.5" fill="#1e3a8a">外部传感器</text>
+    <text x="692" y="228" font-size="9.5" fill="#1e3a8a">/ 执行器</text>
+
+    <rect x="560" y="436" width="90" height="34" rx="4" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.4"/>
+    <text x="568" y="457" font-size="9.5" fill="#1e3a8a">I2C 扩展 JST 4P</text>
+
+    <rect x="400" y="436" width="140" height="34" rx="4" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="408" y="457" font-size="9.5" fill="#334155">AO3400 低边开关 + 续流二极管</text>
+
+    <!-- 指示灯 -->
+    <circle cx="330" cy="448" r="6" fill="#f87171" stroke="#0f172a" stroke-width="1.2"/>
+    <circle cx="356" cy="448" r="6" fill="#34d399" stroke="#0f172a" stroke-width="1.2"/>
+    <text x="286" y="478" font-size="9.5" fill="#334155">电源 / 状态 LED</text>
+  </g>
+
+  <!-- ============ 尺寸标注 ============ -->
+  <g stroke="#0f172a" stroke-width="1" fill="#0f172a">
+    <line x1="170" y1="86" x2="688" y2="86"/>
+    <line x1="170" y1="80" x2="170" y2="92"/><line x1="688" y1="80" x2="688" y2="92"/>
+    <text x="429" y="78" font-size="11" text-anchor="middle">74.0</text>
+    <line x1="142" y1="110" x2="142" y2="488"/>
+    <line x1="136" y1="110" x2="148" y2="110"/><line x1="136" y1="488" x2="148" y2="488"/>
+    <text x="130" y="302" font-size="11" text-anchor="middle" transform="rotate(-90 130 302)">54.0</text>
+  </g>
+
+  <!-- ============ 设计说明 ============ -->
+  <g transform="translate(30,505)">
+    <rect x="0" y="0" width="840" height="96" rx="8" fill="#eff6ff" stroke="#60a5fa"/>
+    <text x="14" y="24" font-size="12" font-weight="700" fill="#1e3a8a">这块载板到底解决什么问题</text>
+    <text x="14" y="44" font-size="11" fill="#1e3a8a">① 引出：核心板排针全部引到端子台，外部传感器不用再飞线，课堂演示可以直接插拔。</text>
+    <text x="14" y="62" font-size="11" fill="#1e3a8a">② 供电：USB-C 输入 + TP4056 + JST 电池接口，让板子既能插电跑也能脱机用充电宝跑（本项目实测过）。</text>
+    <text x="14" y="80" font-size="11" fill="#1e3a8a">③ 扩展：I2C 4P 与低边开关，为「加陀螺仪」「驱动补光 LED」这类后续需求留好插座，不用改核心板。</text>
+  </g>
+</svg>

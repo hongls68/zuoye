@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 620" width="900" height="620" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+  <rect width="900" height="620" fill="#ffffff"/>
+  <text x="30" y="38" font-size="19" font-weight="700" fill="#0f172a">ESP32-S3-EYE 外壳 · 侧视剖面（沿长度方向剖切）</text>
+  <text x="30" y="60" font-size="12" fill="#64748b">单位 mm　·　比例 1:1　·　关键结论：上盖做成阶梯状 —— 前段高（让摄像头伸出去），后段低（贴住 LCD）</text>
+
+  <!-- ============ 剖面本体 ============ -->
+  <g transform="translate(0,0)">
+    <!-- 基准：外壳底面 y=470，长度 x = 70 + mm*9 -->
+    <!-- 底板 0~2.5mm -->
+    <rect x="70" y="447.5" width="666" height="22.5" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="82" y="463" font-size="10.5" fill="#0f172a">底板 2.5</text>
+
+    <!-- 铜柱（主板下方 ×2）-->
+    <rect x="124" y="402.5" width="36" height="45" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.2"/>
+    <rect x="430" y="402.5" width="36" height="45" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.2"/>
+    <!-- 铜柱（子板下方 ×2）-->
+    <rect x="520" y="402.5" width="36" height="45" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.2"/>
+    <rect x="660" y="402.5" width="36" height="45" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.2"/>
+    <text x="128" y="428" font-size="10" fill="#64748b">M2.5×5 铜柱 ×4</text>
+
+    <!-- 主板 PCB：长 35，x 从 6mm 到 41mm -->
+    <rect x="124" y="388.1" width="315" height="14.4" fill="#94a3b8" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="132" y="399" font-size="10.5" fill="#0f172a">主板 PCB 1.6（含 QMA7981 / SD / 麦克风）</text>
+
+    <!-- 摄像头模组（主板前段上方） -->
+    <rect x="150" y="334.1" width="72" height="54" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+    <circle cx="186" cy="352" r="14" fill="none" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="150" y="326" font-size="10" fill="#64748b">OV2640 模组 高 6.0</text>
+
+    <!-- 子板 PCB：长 25，x 从 42mm 到 67mm -->
+    <rect x="448" y="388.1" width="225" height="14.4" fill="#94a3b8" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="456" y="399" font-size="10.5" fill="#0f172a">子板 PCB 1.6</text>
+
+    <!-- LCD 模组：厚 3.2 -->
+    <rect x="470" y="359.3" width="181" height="28.8" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="478" y="378" font-size="10.5" fill="#0f172a">1.3" LCD 模组 3.2</text>
+
+    <!-- FPC 排线连接（主板→子板） -->
+    <path d="M439 395 C 444 372, 452 372, 458 381" fill="none" stroke="#0f172a" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="418" y="418" font-size="9.5" fill="#64748b">FPC 排线</text>
+
+    <!-- 上盖：前段高（18.1），后段低（15.3） -->
+    <!-- 前段：mm 0 → 44，顶面 18.1 → y 307.1，内面 15.6 → y 329.6 -->
+    <path d="M70 307.1 H466 V322.3 H726 V307.1 H726 V284.6 H70 Z" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.6"/>
+    <!-- 实际画法：前段盖 + 后段盖 -->
+    <rect x="70" y="307.1" width="396" height="22.5" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.6"/>
+    <rect x="466" y="329.6" width="260" height="22.5" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.6"/>
+    <rect x="466" y="307.1" width="14" height="45" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="80" y="322" font-size="10.5" fill="#0f172a">上盖（前段）2.5　顶面 18.1</text>
+    <text x="486" y="345" font-size="10.5" fill="#0f172a">上盖（后段）2.5　顶面 15.3　← 台阶 2.8</text>
+
+    <!-- 摄像头视窗（前段盖上的开孔） -->
+    <rect x="146" y="307.1" width="80" height="22.5" fill="#ffffff" stroke="#0f172a" stroke-width="1.4" stroke-dasharray="5 3"/>
+    <text x="146" y="300" font-size="9.5" fill="#64748b">Ø20 视窗</text>
+
+    <!-- LCD 视窗（后段盖上的开孔） -->
+    <rect x="470" y="329.6" width="181" height="22.5" fill="#ffffff" stroke="#0f172a" stroke-width="1.4" stroke-dasharray="5 3"/>
+    <text x="530" y="356" font-size="9.5" fill="#64748b">LCD 视窗 26.5 × 19.9</text>
+  </g>
+
+  <!-- ============ 尺寸链 ============ -->
+  <g transform="translate(770,120)">
+    <rect x="0" y="0" width="110" height="330" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="10" y="22" font-size="11" font-weight="700" fill="#0f172a">高度尺寸链</text>
+    <line x1="26" y1="34" x2="26" y2="316" stroke="#0f172a" stroke-width="1"/>
+    <g font-size="10" fill="#334155">
+      <line x1="20" y1="46" x2="32" y2="46" stroke="#0f172a"/>
+      <text x="36" y="49">底板 2.5</text>
+      <line x1="20" y1="86" x2="32" y2="86" stroke="#0f172a"/>
+      <text x="36" y="89">铜柱 5.0</text>
+      <line x1="20" y1="126" x2="32" y2="126" stroke="#0f172a"/>
+      <text x="36" y="129">PCB 1.6</text>
+      <line x1="20" y1="166" x2="32" y2="166" stroke="#0f172a"/>
+      <text x="36" y="169">摄像头 6.0</text>
+      <line x1="20" y1="206" x2="32" y2="206" stroke="#0f172a"/>
+      <text x="36" y="209">间隙 0.5</text>
+      <line x1="20" y1="246" x2="32" y2="246" stroke="#0f172a"/>
+      <text x="36" y="249">上盖 2.5</text>
+      <line x1="20" y1="286" x2="32" y2="286" stroke="#0f172a"/>
+      <text x="36" y="289">合计 18.1</text>
+    </g>
+    <text x="10" y="310" font-size="9.5" fill="#64748b">后段不含摄像头，</text>
+    <text x="10" y="324" font-size="9.5" fill="#64748b">故低 2.8，总高 15.3</text>
+  </g>
+
+  <!-- ============ 三条设计约束 ============ -->
+  <g transform="translate(30,510)">
+    <rect x="0" y="0" width="740" height="86" rx="8" fill="#fffbeb" stroke="#fbbf24"/>
+    <text x="14" y="24" font-size="12" font-weight="700" fill="#92400e">三条必须遵守的结构约束</text>
+    <text x="14" y="44" font-size="11" fill="#78350f">① 子板与主板同平面并排，不叠放 —— 叠放会让 LCD 盖住摄像头 66.5° 视场。</text>
+    <text x="14" y="62" font-size="11" fill="#78350f">② 上盖必须做台阶 —— 前段留出摄像头 6.0 的高度，后段压低贴住 LCD，否则整机白高 2.8 mm。</text>
+    <text x="14" y="80" font-size="11" fill="#78350f">③ 所有开孔开在盖板上而非侧壁 —— 侧壁开孔会切断卡扣，反复拆装必裂。</text>
+  </g>
+</svg>

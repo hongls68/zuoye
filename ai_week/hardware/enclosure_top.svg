@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 720" width="900" height="720" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+  <rect width="900" height="720" fill="#ffffff"/>
+  <text x="30" y="38" font-size="19" font-weight="700" fill="#0f172a">ESP32-S3-EYE 外壳 · 顶视图（开孔与定位）</text>
+  <text x="30" y="60" font-size="12" fill="#64748b">单位 mm　·　比例 1:1（图纸内 1 mm = 1 单位）　·　★ 标记的尺寸为示例值，打样前必须用卡尺实测复核</text>
+
+  <!-- ================= 顶视图 ================= -->
+  <g transform="translate(120,110)">
+    <!-- 外壳外形：W 54 × L 74 -->
+    <rect x="0" y="0" width="540" height="740" rx="18" fill="#f8fafc" stroke="#0f172a" stroke-width="2.5"/>
+    <!-- 内腔（壁厚 2.5） -->
+    <rect x="25" y="25" width="490" height="690" rx="10" fill="none" stroke="#94a3b8" stroke-width="1" stroke-dasharray="6 4"/>
+    <text x="30" y="45" font-size="10" fill="#94a3b8">内腔（壁厚 2.5）</text>
+
+    <!-- 主板占位：45 × 35（★示例） -->
+    <rect x="45" y="60" width="450" height="350" fill="#e2e8f0" stroke="#475569" stroke-width="1.6" stroke-dasharray="9 5"/>
+    <text x="52" y="80" font-size="11" fill="#475569">主板 ESP32-S3-EYE-MB　45.0 × 35.0 ★</text>
+
+    <!-- 子板（LCD）占位：45 × 25（★示例） -->
+    <rect x="45" y="420" width="450" height="250" fill="#eef2f7" stroke="#475569" stroke-width="1.6" stroke-dasharray="9 5"/>
+    <text x="52" y="440" font-size="11" fill="#475569">子板 ESP32-S3-EYE-SUB + 1.3" LCD　45.0 × 25.0 ★</text>
+
+    <!-- 摄像头视窗（在主板靠上居中） -->
+    <circle cx="270" cy="115" r="42" fill="#fff" stroke="#0f172a" stroke-width="2"/>
+    <circle cx="270" cy="115" r="34" fill="none" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="270" y="120" font-size="11" text-anchor="middle" fill="#0f172a">Ø66</text>
+    <text x="270" y="176" font-size="10" text-anchor="middle" fill="#64748b">摄像头视窗（避让 66.5° FOV）</text>
+
+    <!-- 三个功能按键开孔 -->
+    <g>
+      <circle cx="120" cy="255" r="13" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+      <circle cx="180" cy="255" r="13" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+      <circle cx="240" cy="255" r="13" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+      <text x="120" y="259" font-size="9" text-anchor="middle" fill="#334155">M</text>
+      <text x="180" y="259" font-size="9" text-anchor="middle" fill="#334155">U</text>
+      <text x="240" y="259" font-size="9" text-anchor="middle" fill="#334155">P</text>
+      <text x="120" y="288" font-size="10" fill="#64748b">MENU / UP+ / PLAY　Ø13 ★</text>
+    </g>
+
+    <!-- MicroSD 卡槽开口（右侧） -->
+    <rect x="470" y="215" width="95" height="34" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="517" y="237" font-size="10" text-anchor="middle" fill="#334155">MicroSD</text>
+    <text x="470" y="205" font-size="10" fill="#64748b">SD 卡插拔口</text>
+
+    <!-- Micro-USB 开口（底边） -->
+    <rect x="222" y="735" width="96" height="30" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="270" y="756" font-size="10" text-anchor="middle" fill="#334155">Micro-USB</text>
+    <text x="330" y="756" font-size="10" fill="#64748b">充电 + 烧录 + 串口</text>
+
+    <!-- 四角安装柱 M2.5 -->
+    <g fill="#fff" stroke="#0f172a" stroke-width="1.4">
+      <circle cx="14" cy="14" r="7"/><circle cx="526" cy="14" r="7"/>
+      <circle cx="14" cy="726" r="7"/><circle cx="526" cy="726" r="7"/>
+    </g>
+    <text x="546" y="18" font-size="10" fill="#64748b">4 × Ø2.7 通孔（M2.5 铜柱）</text>
+
+    <!-- 三脚架螺纹孔 -->
+    <circle cx="270" cy="700" r="9" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="288" y="704" font-size="10" fill="#64748b">1/4"-20 三脚架螺母位</text>
+
+    <!-- 散热栅格 -->
+    <g stroke="#0f172a" stroke-width="1.4">
+      <line x1="330" y1="300" x2="330" y2="340"/><line x1="352" y1="300" x2="352" y2="340"/>
+      <line x1="374" y1="300" x2="374" y2="340"/><line x1="396" y1="300" x2="396" y2="340"/>
+      <line x1="418" y1="300" x2="418" y2="340"/><line x1="440" y1="300" x2="440" y2="340"/>
+    </g>
+    <text x="330" y="358" font-size="10" fill="#64748b">散热栅格（模组正上方）</text>
+
+    <!-- 外形尺寸标注 -->
+    <g stroke="#0f172a" stroke-width="1" fill="#0f172a">
+      <line x1="0" y1="-34" x2="540" y2="-34"/>
+      <line x1="0" y1="-40" x2="0" y2="-28"/><line x1="540" y1="-40" x2="540" y2="-28"/>
+      <text x="270" y="-42" font-size="12" text-anchor="middle">54.0 ★</text>
+      <line x1="-34" y1="0" x2="-34" y2="740"/>
+      <line x1="-40" y1="0" x2="-28" y2="0"/><line x1="-40" y1="740" x2="-28" y2="740"/>
+      <text x="-46" y="370" font-size="12" text-anchor="middle" transform="rotate(-90 -46 370)">74.0 ★</text>
+    </g>
+  </g>
+
+  <!-- ================= 图例 ================= -->
+  <g transform="translate(700,150)">
+    <rect x="0" y="0" width="170" height="290" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="14" y="26" font-size="12" font-weight="700" fill="#0f172a">图例</text>
+    <rect x="14" y="42" width="18" height="12" fill="#e2e8f0" stroke="#475569" stroke-dasharray="4 3"/>
+    <text x="40" y="52" font-size="11" fill="#475569">板卡占位</text>
+    <rect x="14" y="66" width="18" height="12" fill="#fff" stroke="#0f172a" stroke-width="1.6"/>
+    <text x="40" y="76" font-size="11" fill="#475569">开孔 / 视窗</text>
+    <circle cx="23" cy="97" r="7" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
+    <text x="40" y="101" font-size="11" fill="#475569">安装孔</text>
+    <line x1="14" y1="122" x2="32" y2="122" stroke="#0f172a" stroke-width="1"/>
+    <text x="40" y="126" font-size="11" fill="#475569">尺寸线</text>
+    <line x1="14" y1="147" x2="32" y2="147" stroke="#94a3b8" stroke-dasharray="6 4"/>
+    <text x="40" y="151" font-size="11" fill="#475569">内腔轮廓</text>
+
+    <text x="14" y="186" font-size="12" font-weight="700" fill="#b91c1c">★ = 示例值</text>
+    <text x="14" y="206" font-size="10.5" fill="#475569">板卡外形与孔径为示例，</text>
+    <text x="14" y="222" font-size="10.5" fill="#475569">打样前必须实测复核。</text>
+    <text x="14" y="238" font-size="10.5" fill="#475569">依据：乐鑫官方尺寸图</text>
+    <text x="14" y="254" font-size="10.5" fill="#475569">（PDF / DXF）或卡尺实测。</text>
+    <text x="14" y="276" font-size="10.5" fill="#475569">其余为设计给定值，可直接用。</text>
+  </g>
+</svg>
