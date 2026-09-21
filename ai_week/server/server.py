@@ -77,6 +77,9 @@ def now_iso() -> str:
 
 
 def get_db() -> sqlite3.Connection:
+    # DATA_DIR 可能指向一个还不存在的目录（例如自测用 ./tmpdata），先补出来，
+    # 否则 sqlite 直接抛 "unable to open database file"，排查起来很绕。
+    os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
@@ -359,6 +362,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self._end_headers_close()
+        self.wfile.write(body)
 
     def _send_html(self) -> None:
         try:

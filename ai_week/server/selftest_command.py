@@ -35,6 +35,10 @@ from datetime import datetime, timedelta, timezone
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000").rstrip("/")
 TZ = timezone(timedelta(hours=8))
 
+# 本机若开着 HTTP 代理（Clash 之类），127.0.0.1 的请求也会被劫走，导致自测全红。
+# 自测只打本机，显式绕开代理。
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # 每次运行都用一套全新的虚拟设备号与开机标识。
 # 否则同一台服务端上重跑第二次时，E3 会拿上一轮留下的 seq 做比较，
 # 报一堆"seq 未递增"的假失败 —— 这个坑第一次就踩到了。
@@ -77,7 +81,7 @@ def req(method: str, path: str, data=None, headers=None, raw=None):
         hdrs["Content-Type"] = "application/json"
     r = urllib.request.Request(BASE + path, data=body, headers=hdrs, method=method)
     try:
-        with urllib.request.urlopen(r, timeout=15) as resp:
+        with OPENER.open(r, timeout=15) as resp:
             payload = resp.read()
             if "json" in resp.headers.get("Content-Type", ""):
                 return resp.status, json.loads(payload.decode("utf-8"))
