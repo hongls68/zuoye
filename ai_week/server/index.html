@@ -72,6 +72,40 @@
   .timeline .tstate { color: var(--txt); }
   .timeline .twhen { color: var(--dim); font-variant-numeric: tabular-nums; }
   .timeline li.dim { color: var(--dim); justify-content: flex-start; }
+  /* ---- 第2周：照片画廊（元数据永久保留，原图按配额清理）---- */
+  .galbar {
+    display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
+    font-size: 12px; color: var(--dim); margin-bottom: 14px;
+  }
+  .galbar b { color: var(--txt); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+  .shot {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .shot .thumb {
+    position: relative; width: 100%; aspect-ratio: 4 / 3; background: #000;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .shot .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .shot .thumb .gone {
+    color: var(--dim); font-size: 12px; text-align: center; line-height: 1.8; padding: 10px;
+  }
+  .shot .meta { padding: 10px 12px 12px; font-size: 12px; color: var(--dim); }
+  .shot .meta .row { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; }
+  .shot .meta .row span:last-child { color: var(--txt); font-variant-numeric: tabular-nums; text-align: right; }
+  .shot .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .shot .hash { margin-top: 6px; word-break: break-all; }
+  .lightbox {
+    position: fixed; inset: 0; background: rgba(2, 6, 23, .88); display: none;
+    align-items: center; justify-content: center; padding: 24px; z-index: 50;
+  }
+  .lightbox.on { display: flex; }
+  .lightbox img { max-width: 92vw; max-height: 82vh; border-radius: 8px; border: 1px solid var(--line); }
+  .lightbox .cap {
+    position: absolute; bottom: 20px; left: 0; right: 0; text-align: center;
+    font-size: 12px; color: var(--dim); padding: 0 20px;
+  }
 </style>
 </head>
 <body>
@@ -123,13 +157,33 @@
   </table>
 
   <section class="cam">
+    <div class="label">照片画廊 · 每一帧都在这里（原图按配额清理，元数据与哈希永久保留）</div>
+    <div class="galbar">
+      <span>共 <b id="galTotal">0</b> 帧</span>
+      <span>原图保留中 <b id="galKept">0</b></span>
+      <span>已按配额清理 <b id="galPurged">0</b></span>
+      <span>占用 <b id="galBytes">0 KB</b></span>
+      <span>保留期 <b id="galRetention">--</b> 天</span>
+      <span class="code">GET /api/frames</span>
+    </div>
+    <div class="gal" id="galGrid"><div class="code">加载中…</div></div>
+    <div class="camnote">已清理的帧仍会留在列表里，带着 SHA-256 与拍摄时间 —— 图片可以过期，证据不过期。点击缩略图可放大原图。</div>
+  </section>
+
+  <div class="lightbox" id="lightbox">
+    <img id="lightboxImg" alt="原图">
+    <div class="cap" id="lightboxCap"></div>
+  </div>
+
+  <section class="cam">
     <div class="label">实时摄像头 · 板载 OV2640（充电宝供电脱机也能无线传图到电脑）</div>
     <img id="cam" alt="等待图像…">
     <div class="camnote" id="camNote">等待开发板上传第一帧…</div>
   </section>
 
   <div class="note">说明：本页数值全部来自服务器查询接口 /api/latest 与 /api/history，不含任何写死的演示数据。停止采集后，页面将保留最后一条记录的时间并提示"数据未更新"。摄像头画面来自 /api/frame/latest，开发板停止上传后定格在最后一帧。<br>
-  远程采集区与上面的周期数据是两条独立通道：暂停刷新只停住上面的数据视图，指令通道照常工作 —— 这正是「暂停周期上报后，命令触发仍能出新数据」要验证的行为。请求编号 / 采集时刻 / 开机标识+序号 这三组信息就是用来回答"这张图到底是不是这次拍的"。</div>
+  远程采集区与上面的周期数据是两条独立通道：暂停刷新只停住上面的数据视图，指令通道照常工作 —— 这正是「暂停周期上报后，命令触发仍能出新数据」要验证的行为。请求编号 / 采集时刻 / 开机标识+序号 这三组信息就是用来回答"这张图到底是不是这次拍的"。<br>
+  照片画廊的数据来自 /api/frames：每帧都记下 SHA-256、分辨率、字节数与来源；原图超过保留期会被后台清理（默认 7 天，可用环境变量 RETENTION_DAYS 调整），但**元数据与哈希永久保留**，所以已清理的帧在列表里依然可查、可校验。</div>
 
 <script>
 (function () {
@@ -236,6 +290,7 @@
   el('deviceSelect').addEventListener('change', function () {
     tick();
     refreshRequests();   // 换设备时，指令列表与当前追踪的请求一起跟着切
+    refreshGallery();    // 画廊也跟着切设备
   });
 
   // ================= 第2周：远程采集指令 =================
@@ -363,6 +418,101 @@
   el('captureBtn').addEventListener('click', sendCapture);
   setInterval(refreshRequests, POLL_MS);
   refreshRequests();
+
+  // ================= 第2周：照片画廊 =================
+  // 元数据永久保留、原图按配额清理 —— 所以「已清理」的帧照样要出现在列表里，
+  // 只是缩略图位置换成哈希。这样既省存储，又不丢可追溯性：
+  // 图片可以过期，证据不过期。
+  var GAL_MS = 3000;
+
+  function fmtBytes(n) {
+    if (n === null || n === undefined) return '--';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(2) + ' MB';
+  }
+
+  function srcBadge(s) {
+    if (s === 'web_manual') return '<span class="badge info">网页指令</span>';
+    if (s === 'periodic') return '<span class="badge">周期抓拍</span>';
+    return '<span class="badge">来源未知</span>';
+  }
+
+  function stBadge(f) {
+    if (f.purged) return '<span class="badge warn">原图已清理</span>';
+    if (f.command_state === 'COMPLETED') return '<span class="badge ok">证据齐全</span>';
+    if (f.command_state) return '<span class="badge err">' + f.command_state + '</span>';
+    return '<span class="badge ok">在库</span>';
+  }
+
+  function renderGallery(data) {
+    var st = data.storage || {};
+    el('galTotal').textContent = st.total || 0;
+    el('galKept').textContent = st.kept || 0;
+    el('galPurged').textContent = st.purged || 0;
+    el('galBytes').textContent = fmtBytes(st.kept_bytes);
+    el('galRetention').textContent = (st.retention_days === undefined ? '--' : st.retention_days);
+
+    var grid = el('galGrid');
+    var list = data.frames || [];
+    if (!list.length) {
+      grid.innerHTML = '<div class="code">还没有任何一帧。开发板连上后会自动周期抓拍，' +
+                       '也可以在下面点「采集一次最新数据」。</div>';
+      return;
+    }
+    grid.innerHTML = list.map(function (f) {
+      var res = (f.width && f.height) ? (f.width + '×' + f.height) : '—';
+      var thumb = f.purged
+        ? '<div class="gone">原图已按配额清理<br>哈希仍在，可校验</div>'
+        : '<img loading="lazy" src="/api/frames/image?id=' + f.id + '" alt="帧 ' + f.id + '">';
+      return '<div class="shot">' +
+        '<div class="thumb" data-id="' + f.id + '" data-purged="' + (f.purged ? 1 : 0) + '">' +
+          thumb + '</div>' +
+        '<div class="meta">' +
+          '<div class="tags">' + srcBadge(f.source) + stBadge(f) + '</div>' +
+          '<div class="row"><span>帧号</span><span>#' + f.id + '</span></div>' +
+          '<div class="row"><span>分辨率</span><span>' + res + '</span></div>' +
+          '<div class="row"><span>大小</span><span>' + fmtBytes(f.bytes) + '</span></div>' +
+          '<div class="row"><span>拍摄时间</span><span>' + (f.capture_ts || f.ts_server) + '</span></div>' +
+          (f.request_id
+            ? '<div class="row"><span>请求</span><span class="code">' + f.request_id + '</span></div>'
+            : '') +
+          '<div class="hash code">sha256 ' +
+            (f.sha256 ? f.sha256.slice(0, 16) + '…' : '—') + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  function refreshGallery() {
+    var dev = el('deviceSelect').value;
+    var q = dev ? ('?device_id=' + encodeURIComponent(dev) + '&limit=48') : '?limit=48';
+    fetch('/api/frames' + q).then(function (r) { return r.json(); })
+      .then(renderGallery)
+      .catch(function () { /* 画廊拉取失败不打扰主视图，下一轮自愈 */ });
+  }
+
+  function closeLightbox() {
+    el('lightbox').className = 'lightbox';
+    el('lightboxImg').removeAttribute('src');
+  }
+
+  el('galGrid').addEventListener('click', function (e) {
+    var box = e.target.closest && e.target.closest('.thumb');
+    if (!box) return;
+    if (box.getAttribute('data-purged') === '1') return;   // 原图没了，放大没意义
+    var id = box.getAttribute('data-id');
+    el('lightboxImg').src = '/api/frames/image?id=' + id;
+    el('lightboxCap').textContent = '帧 #' + id + ' · 点任意处关闭（Esc）';
+    el('lightbox').className = 'lightbox on';
+  });
+  el('lightbox').addEventListener('click', closeLightbox);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeLightbox();
+  });
+
+  setInterval(refreshGallery, GAL_MS);
+  refreshGallery();
 
   // 摄像头画面：独立于数据轮询，固定读 /api/frame/latest 并加时间戳防缓存
   function refreshCam() {

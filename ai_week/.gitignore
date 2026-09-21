@@ -11,6 +11,10 @@ server/*.log
 # 摄像头帧归档（实时显示只需 latest.jpg，历史帧不入库）
 server/snapshots/
 
+# 自测用的隔离数据目录（selftest_gallery.py 每轮新建，跑完自删）
+server/tmpdata*/
+tmpdata*/
+
 # Python
 __pycache__/
 *.pyc
