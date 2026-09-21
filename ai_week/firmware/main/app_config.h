@@ -136,4 +136,42 @@
 #define CMD_POLL_INTERVAL_MS    5000    /* 取指令轮询周期 */
 #define CMD_TIMEOUT_MS          8000    /* 命令通道单次 HTTP 超时（与上传超时分开）*/
 
+/* ============ 8. 按键触发与本地反馈（第3周）============
+ * 与第2周方向相反：这次是**板子主动发起**一件事，网页上的人来回应。
+ *
+ * 【硬件依据】乐鑫官方 ESP-BSP 的 ESP32-S3-EYE 板级定义
+ *   （esp-bsp/bsp/esp32_s3_eye/include/bsp/esp32_s3_eye.h）
+ *     BSP_BUTTON_5_IO = GPIO_NUM_0   板载 BOOT 键 —— 板上唯一可自由读取的按键
+ *     BSP_LED_1_IO    = GPIO_NUM_3   模组电源指示灯 —— 官方明确支持软件控制
+ *
+ * 【重要】GPIO3 必须开漏驱动（代码里已用 GPIO_MODE_OUTPUT_OD），
+ *   直接推挽输出高电平可能烧掉 LED（官方文档警告，v2.2 板为此加了限流电阻 R83）。
+ *
+ * 【按键操作】
+ *   短按         空闲时发起一次求助；进行中则取消这一次求助
+ *   长按 2 秒    强制重新发起（自动取消上一条，换一个新的 event_id）
+ *
+ * 【LED 反馈（一眼能区分三种状态来源）】
+ *   慢闪（1s 周期）  ① 本地已确认 —— 按键受理了，还没发出去
+ *   快闪（0.2s 周期）    正在发送到 VPS
+ *   常亮             ② VPS 已接收 —— 服务端回了回执，但还没人回应
+ *   三连闪×2         ③ 查看者已回应 —— 网页前的人点了回应
+ *   长闪 4 次        已取消
+ *   急闪 10 次       发送失败
+ */
+#define HELP_ENABLE             1       /* 1=启用按键求助通道；0=完全关闭 */
+#define HELP_BTN_GPIO           0       /* 板载 BOOT 键（官方 BSP: BSP_BUTTON_5_IO）*/
+#define HELP_LED_GPIO           3       /* 板载模组电源指示灯（官方 BSP: BSP_LED_1_IO）*/
+#define HELP_TIMEOUT_MS         8000    /* 求助通道单次 HTTP 超时 */
+#define HELP_LONG_PRESS_MS      2000    /* 长按判定阈值（毫秒）*/
+#define HELP_MIN_PRESS_MS       30      /* 短于这个时长视为抖动，忽略 */
+#define HELP_DEBOUNCE_SAMPLES   3       /* 连续 N 次（20ms/次）读到同一电平才认账 */
+
+/* 蜂鸣器：**板载没有**（官方 BSP 里 BSP_CAPS_AUDIO_SPEAKER = 0），
+ * 必须外接才能用。想用就把 BUZZER_ENABLE 置 1 并填上实际接的引脚。
+ * 用 LEDC 输出 2.7kHz 方波：无源蜂鸣器直接可用，有源蜂鸣器也能响。
+ * 建议接在载板上（见 hardware/carrier_pcb.svg 的 4P 端子台）。 */
+#define BUZZER_ENABLE           0       /* 1=启用外接蜂鸣器 */
+#define BUZZER_GPIO             2       /* 仅在 BUZZER_ENABLE=1 时有效（GPIO2 是空闲的排针脚）*/
+
 #endif /* APP_CONFIG_H */

@@ -43,6 +43,7 @@
 #include "app_config.h"
 #include "qma7981.h"
 #include "camera.h"
+#include "help_btn.h"
 
 static const char *TAG = "app";
 
@@ -672,6 +673,14 @@ void app_main(void)
     /* 1.5) 生成本次开机标识（供服务器做 E3 新鲜度校验），必须在 NVS 就绪之后 */
     boot_id_init();
 
+    /* 1.6) 第3周：按键 + 本地反馈。
+     * 刻意放在连 Wi-Fi **之前** —— 本地反馈（LED）不该依赖网络：
+     * 断网时按下去，板子也要能立刻用灯告诉用户"我收到了"，
+     * 然后才是"发不出去"。顺序反过来的话，断网时按键会毫无反应。 */
+#if HELP_ENABLE
+    help_btn_init(s_boot_id);
+#endif
+
     /* 2) 初始化板载加速度计。失败时不上传任何数据，只报错。 */
     uint8_t chip_id = 0;
     ret = qma7981_init(&chip_id);
@@ -717,6 +726,10 @@ void app_main(void)
     ESP_LOGI(TAG, "远程指令通道已启用，取指令周期 %d ms（与周期上报相互独立）",
              CMD_POLL_INTERVAL_MS);
 #endif
+#if HELP_ENABLE
+    ESP_LOGI(TAG, "按键求助通道已启用：短按 GPIO%d 发起/取消，长按 %dms 重发",
+             HELP_BTN_GPIO, HELP_LONG_PRESS_MS);
+#endif
 
     /* 6) 主循环 */
     uint32_t fail_streak = 0;
@@ -742,6 +755,26 @@ void app_main(void)
             if (now_us - last_poll_us >= (int64_t)CMD_POLL_INTERVAL_MS * 1000) {
                 last_poll_us = now_us;
                 handle_remote_command();
+            }
+        }
+#endif
+
+        /*
+         * 0.5) 第3周：按键求助通道。
+         *
+         * 按键本身在 20ms 的定时器里采集（见 help_btn.c），这里只负责
+         * "取走待办动作并执行 HTTP"。同样与周期上报解耦 ——
+         * 暂停周期上报时按键求助照样能用。
+         *
+         * 注意：这个函数内部不做重试。按一次就是一次，失败就如实报失败 ——
+         * 偷偷重发会让"本地确认"和"VPS 接收"的时间差变得不可解释。
+         */
+#if HELP_ENABLE
+        if (s_wifi_connected) {
+            help_action_t hact = help_btn_poll();
+            if (hact != HELP_ACT_NONE) {
+                ESP_LOGI(TAG, "按键动作已处理: %d，当前板端状态 %s",
+                         (int)hact, help_state_name(help_btn_get_state()));
             }
         }
 #endif
