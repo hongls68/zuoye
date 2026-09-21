@@ -53,6 +53,21 @@ static uint32_t s_seq = 0;                 /* 求助事件自己的新鲜度域�
 static volatile help_action_t s_pending = HELP_ACT_NONE;
 static esp_timer_handle_t s_tick_timer = NULL;
 
+/* ★ "先本地确认，再碰网络" 的落地方式。
+ *
+ * 一开始的写法是 do_request() 里连着两句 set_state(LOCAL_ACKED) → set_state(SENDING)，
+ * 中间没有任何间隔 —— 结果"本地已确认"的慢闪只存在了几微秒，
+ * 灯上根本看不见，串口里也就一行日志。那样的话三层状态里的第①层
+ * 在物理反馈上是**不可观测**的，等于没做。
+ *
+ * 现在改成两段式：按下只做本地确认并"装填"待发内容，
+ * 真正的网络请求交给下一个主循环周期（约 0.5~1 秒后）——
+ * 用户能实实在在看到"板子收到我这一按了"（慢闪），然后才转成"正在发"（快闪）。 */
+static bool s_send_armed = false;
+static char s_armed_event[64] = {0};
+
+static bool has_active_help(void);   /* 定义在下面，tick_cb 里要用 */
+
 /* 按键去抖 */
 static int s_btn_stable = 1;               /* 上拉，空闲为高 */
 static int s_btn_last_raw = 1;
@@ -137,6 +152,11 @@ static inline void led_write(int on)
     s_led_on = on;
 }
 
+/* s_led_on 是三态：1=亮、0=灭、-1=刚切状态需要强制重写一次电平。
+ * ★ 判断必须写成 ==1 / !=0 / ==-1 的显式比较，不能写 if (s_led_on) ——
+ *   早期版本用了 if (!s_led_on) 去判断 LED_MODE_ON，结果 -1 是真值，
+ *   "VPS 已接收 → 常亮"这一档**永远不会点亮**。这类"哨兵值当布尔用"的写法
+ *   在只有真机才能验证的地方特别危险，必须显式比较。 */
 static void led_apply(help_state_t st, int64_t now_us)
 {
     const led_pattern_t *p = &s_led_tbl[(int)st];
@@ -144,13 +164,21 @@ static void led_apply(help_state_t st, int64_t now_us)
 
     switch (p->mode) {
     case LED_MODE_OFF:
-        if (s_led_on) led_write(0);
+        if (s_led_on != 0) {
+            led_write(0);
+        }
         break;
     case LED_MODE_ON:
-        if (!s_led_on) led_write(1);
+        if (s_led_on != 1) {
+            led_write(1);
+        }
         break;
     case LED_MODE_BLINK:
-        if (s_led_on) {
+        if (s_led_on == -1) {
+            /* 刚切进来：从"亮"这一段开始，否则第一个周期会白等一个 on_ms */
+            led_write(1);
+            s_led_phase_us = now_us;
+        } else if (s_led_on == 1) {
             if (dt >= (int64_t)p->on_ms * 1000) {
                 led_write(0);
                 s_led_phase_us = now_us;
@@ -226,6 +254,32 @@ static void buzzer_pattern(help_state_t st)
         if (i != times - 1) vTaskDelay(pdMS_TO_TICKS(off));
     }
 }
+
+/* ★ 蜂鸣必须放在独立任务里，不能在 esp_timer 回调里响。
+ *
+ * buzzer_beep() 内部是 vTaskDelay（阻塞），而 tick_cb 是 esp_timer 的回调 ——
+ * esp_timer 回调跑在它自己的高优先级任务里，**在里面阻塞会拖住整个定时器任务**，
+ * 轻则 LED 节拍乱掉，重则触发 task watchdog。
+ * 所以这里用一个任务 + 任务通知：状态跃迁时只发一个非阻塞通知，谁响谁自己延时。 */
+static TaskHandle_t s_buzzer_task = NULL;
+static volatile help_state_t s_buzzer_req = HELP_IDLE;
+
+static void buzzer_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        buzzer_pattern(s_buzzer_req);   /* 在任务上下文里，可以安全阻塞 */
+    }
+}
+
+static void buzzer_trigger(help_state_t st)
+{
+    s_buzzer_req = st;
+    if (s_buzzer_task != NULL) {
+        xTaskNotifyGive(s_buzzer_task);   /* 非阻塞，可安全用于定时器回调 */
+    }
+}
 #endif /* BUZZER_ENABLE */
 
 /* ============ 20ms 节拍：按键去抖 + LED 闪烁 ============ */
@@ -250,7 +304,8 @@ static void tick_cb(void *arg)
             if (dur_ms >= HELP_LONG_PRESS_MS) {
                 s_pending = HELP_ACT_RESEND;
             } else if (dur_ms >= HELP_MIN_PRESS_MS) {
-                s_pending = (s_state == HELP_IDLE) ? HELP_ACT_REQUEST : HELP_ACT_CANCEL;
+                /* 短按：有活跃求助就取消，没有就发起新的（见 has_active_help 注释）*/
+                s_pending = has_active_help() ? HELP_ACT_CANCEL : HELP_ACT_REQUEST;
             } else {
                 ESP_LOGD(TAG, "按键按下 %lld ms，视为抖动，忽略", (long long)dur_ms);
             }
@@ -273,10 +328,9 @@ void help_btn_set_state(help_state_t st)
     s_state = st;
     s_led_phase_us = esp_timer_get_time();
     s_led_repeat_done = 0;
-    s_led_on = -1;          /* 强制下一次 apply 重新写一次电平 */
+    s_led_on = -1;          /* 强制下一次 apply 重写一次电平（-1 = 未知）*/
 #if BUZZER_ENABLE
-    /* 蜂鸣是阻塞的，只在状态跃迁时响一次，不影响主循环的周期上报 */
-    buzzer_pattern(st);
+    buzzer_trigger(st);     /* 只发通知，不在这里阻塞 */
 #endif
 }
 
@@ -418,6 +472,11 @@ static bool help_poll_viewer(void)
             }
             rd += n;
         }
+    } else {
+        /* ★ 非 200 也必须把响应体读干净再关连接。
+         * 不读干净就 close，协议栈会发 RST —— 第1周在 /api/ingest 上踩过同一个坑，
+         * 表现为"服务端明明收到了，板子这边却报错"。 */
+        drain_body(client);
     }
     body[rd] = '\0';
     esp_http_client_close(client);
@@ -463,19 +522,29 @@ static void do_request(bool resend)
     /* 求助事件编号由**板子自己生成** —— 因为这一次是设备主动发起，
      * 与第2周"网页发起、服务端生成 request_id"方向正好相反。 */
     s_seq++;
-    snprintf(s_event_id, sizeof(s_event_id), "help-%s-%lu",
+    snprintf(s_armed_event, sizeof(s_armed_event), "help-%s-%lu",
              s_boot_id, (unsigned long)s_seq);
 
-    /* ① 本地确认：先让用户看到"按下去了"，再去碰网络。
-     *    顺序很重要 —— 本地反馈不能等网络，否则断网时按下去毫无反应。 */
-    ESP_LOGI(TAG, "① 本地已确认：教学求助测试消息（event=%s）", s_event_id);
+    /* ① 本地确认：先把"按下了"这件事在本地坐实，再考虑网络。
+     *    这一步不碰网络 —— 断网时按下去也必须立刻有反馈。 */
+    ESP_LOGI(TAG, "① 本地已确认（LED 慢闪）：教学求助测试消息（event=%s）", s_armed_event);
     help_btn_set_state(HELP_LOCAL_ACKED);
+    s_send_armed = true;      /* 真正的发送留给下一个主循环周期，让慢闪看得见 */
+}
 
-    ESP_LOGI(TAG, "② 正在发送到 VPS…");
+/* ② 把装填好的求助真正发出去（由 help_btn_poll 在下一个周期调用）*/
+static void flush_send(void)
+{
+    memcpy(s_event_id, s_armed_event, sizeof(s_event_id));
+    s_event_id[sizeof(s_event_id) - 1] = '\0';
+    s_send_armed = false;
+
+    ESP_LOGI(TAG, "② 正在发送到 VPS…（LED 快闪）");
     help_btn_set_state(HELP_SENDING);
     if (help_post("request", s_event_id, NULL, "LOCAL_ACKED")) {
-        /* ② 服务端回执 2xx 才说明"VPS 已接收"，这一步是服务端给的证据 */
-        ESP_LOGI(TAG, "② VPS 已接收（LED 转常亮），等待查看者回应");
+        /* 服务端回执 2xx 才说明"VPS 已接收" —— 这一步是**服务端给的证据**，
+         * 板子单方面说"发出去了"不算数。 */
+        ESP_LOGI(TAG, "② VPS 已接收（LED 常亮），等待查看者回应");
         help_btn_set_state(HELP_ACCEPTED);
     } else {
         ESP_LOGE(TAG, "发送失败：VPS 未确认收到（LED 急闪）");
@@ -485,6 +554,10 @@ static void do_request(bool resend)
 
 static void do_cancel(void)
 {
+    if (s_event_id[0] == '\0') {
+        ESP_LOGW(TAG, "当前没有进行中的求助，忽略取消");
+        return;
+    }
     ESP_LOGW(TAG, "取消求助 %s（由板端按键发起）", s_event_id);
     if (help_post("cancel", s_event_id, "user_cancelled_on_device", "CANCELLED")) {
         help_btn_set_state(HELP_CANCELLED);
@@ -494,26 +567,42 @@ static void do_cancel(void)
     }
 }
 
+/* 短按该干什么，取决于当前有没有"活跃的求助"：
+ *   没有活跃求助（IDLE / 已取消 / 已回应 / 上次发失败）→ 发起一条新的；
+ *   有活跃求助（本地已确认 / 发送中 / VPS 已接收）  → 取消它。
+ * 早期写法只看 "是不是 IDLE"，于是在 FAILED 状态下短按会去取消一条
+ * 根本没送到服务端的求助（服务端回 404），按键行为变得莫名其妙。 */
+static bool has_active_help(void)
+{
+    return s_state == HELP_LOCAL_ACKED || s_state == HELP_SENDING ||
+           s_state == HELP_ACCEPTED;
+}
+
 help_action_t help_btn_poll(void)
 {
     help_action_t act = s_pending;
-    if (act == HELP_ACT_NONE) {
-        /* 没有按键事件时，顺便问一下查看者有没有回应 */
-        if (s_state == HELP_ACCEPTED || s_state == HELP_LOCAL_ACKED ||
-            s_state == HELP_SENDING) {
-            help_poll_viewer();
+    if (act != HELP_ACT_NONE) {
+        s_pending = HELP_ACT_NONE;
+        switch (act) {
+        case HELP_ACT_REQUEST: do_request(false); break;
+        case HELP_ACT_RESEND:  do_request(true);  break;
+        case HELP_ACT_CANCEL:  do_cancel();       break;
+        default: break;
         }
-        return HELP_ACT_NONE;
+        return act;
     }
-    s_pending = HELP_ACT_NONE;
 
-    switch (act) {
-    case HELP_ACT_REQUEST: do_request(false); break;
-    case HELP_ACT_RESEND:  do_request(true);  break;
-    case HELP_ACT_CANCEL:  do_cancel();       break;
-    default: break;
+    /* 装填好了就发（等了一个主循环周期，慢闪已经看得见）*/
+    if (s_send_armed && s_state == HELP_LOCAL_ACKED) {
+        flush_send();
+        return HELP_ACT_REQUEST;
     }
-    return act;
+
+    /* 没有按键事件时，顺便问一下查看者有没有回应 */
+    if (!s_send_armed && has_active_help()) {
+        help_poll_viewer();
+    }
+    return HELP_ACT_NONE;
 }
 
 /* ============ 初始化 ============ */
@@ -556,6 +645,11 @@ esp_err_t help_btn_init(const char *boot_id)
 
 #if BUZZER_ENABLE
     buzzer_init();
+    /* 蜂鸣放在独立任务里跑，状态跃迁时只发通知（不能在 esp_timer 回调里阻塞）*/
+    if (xTaskCreate(buzzer_task, "help_buzz", 3072, NULL, 4, &s_buzzer_task) != pdPASS) {
+        ESP_LOGW(TAG, "蜂鸣任务创建失败，蜂鸣功能不可用（LED 不受影响）");
+        s_buzzer_task = NULL;
+    }
     ESP_LOGI(TAG, "蜂鸣器已启用（GPIO%d，外接）", BUZZER_GPIO);
 #else
     ESP_LOGI(TAG, "蜂鸣器未启用（板载无蜂鸣器，需外接后把 BUZZER_ENABLE 置 1）");
