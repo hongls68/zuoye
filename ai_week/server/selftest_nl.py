@@ -311,6 +311,58 @@ def main() -> int:
     print("  [INFO] Ollama %s：%s" % ("可用" if avail["ok"] else "不可用",
                                       json.dumps(avail, ensure_ascii=False)[:120]))
 
+    print("\n== 17. ★★ 设备无响应：整条链路上每一环都必须如实（\"无响应记录\"）==")
+    # 场景：用户说"让板子现在拍一张"，但板子离线 / 一直不来取指令。
+    # 这是最容易被"假装成功"糊弄过去的场景，所以逐环断言。
+    r = nl.execute_tool("request_capture", {"device_id": "board-A",
+                                            "reason": "无响应场景自测"}, conn)
+    rid2 = r["data"]["request_id"]
+    check("① 指令下发成功（这一步确实成功了，不许含糊）", r["ok"] is True)
+    check("① 但状态只能是 PENDING", r["state"] == "PENDING", r["state"])
+    check("① 且明确不许声称成功", r["success_claim_allowed"] is False)
+
+    # 模拟"设备一直没来取"：把创建时间推到很久以前，再跑一次超时扫描
+    old = (datetime.now(TZ) - timedelta(hours=1)).isoformat(timespec="milliseconds")
+    conn.execute("UPDATE commands SET created_at=? WHERE request_id=?", (old, rid2))
+    conn.commit()
+    n = server.sweep_commands(conn)
+    check("② 超时扫描把没人取的指令标成 EXPIRED（不是 FAILED）", n >= 1, n)
+    row2 = conn.execute("SELECT state, fail_reason FROM commands WHERE request_id=?",
+                        (rid2,)).fetchone()
+    check("② 归因是 EXPIRED（找人）而不是 TIMEOUT（找活）",
+          row2["state"] == server.ST_EXPIRED, row2["state"])
+    check("② 也绝不写 FAILED —— 超时≠硬件故障",
+          row2["state"] != server.ST_FAILED, row2["state"])
+
+    r = nl.execute_tool("get_command_status", {"request_id": rid2}, conn)
+    check("③ 回查时状态如实是 EXPIRED", r["state"] == "EXPIRED", r["state"])
+    check("③ has_frame=False（自始至终没有任何图像证据）",
+          r["data"]["has_frame"] is False)
+    check("③ 返回体里没有\"成功\"字样",
+          "成功" not in json.dumps(r, ensure_ascii=False))
+
+    trace2 = [{"tool": "request_capture", "state": "PENDING",
+               "result": {"ok": True, "state": "PENDING",
+                          "success_claim_allowed": False,
+                          "data": {"request_id": rid2}}},
+              {"tool": "get_command_status", "state": "EXPIRED",
+               "result": {"ok": True, "state": "EXPIRED",
+                          "data": {"state": "EXPIRED", "has_frame": False}}}]
+    g = nl.guard_answer("已经拍好了，图像已入库。", trace2, "让板子拍一张")
+    check("④ 无响应场景下，声称成功被拦下",
+          "success_without_evidence" in g["guardrails"], g["guardrails"])
+    check("④ 拦下后回显的是真实状态 EXPIRED", "EXPIRED" in g["text"], g["text"][:80])
+    g = nl.guard_answer("指令已下发，但设备一直没来取，已过期（EXPIRED），"
+                        "目前没有采集完成的证据。", trace2, "让板子拍一张")
+    check("④ 如实描述无响应则正常放行（不误伤）", g["guardrails"] == [],
+          g["guardrails"])
+    check("⑤ 整条链路任何一环都没有把\"没响应\"说成\"失败\"或\"成功\"",
+          row2["state"] == "EXPIRED" and r["data"]["has_frame"] is False
+          and r["ok"] is True)
+    print("  [INFO] 这一组就是课程要求的『无响应记录』：")
+    print("         request_id=%s → PENDING → EXPIRED（has_frame=False，"
+          "success_claim_allowed=False）" % rid2)
+
     conn.close()
 
     print("\n" + "=" * 60)
