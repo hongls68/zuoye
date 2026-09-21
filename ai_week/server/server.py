@@ -26,8 +26,46 @@ AI交互课 —— 传感器数据接收与存储服务
   数据保留（计划书 4.5）：**元数据（含 SHA-256）永久保留，原图按 RETENTION_DAYS 清理**。
   清掉的是文件，不是证据 —— 画廊里仍能看到这一条的哈希与拍摄时间。
 
+【第3周】按键求助事件（方向反过来：板子主动发起，人来回应）：
+  POST /api/help                  板子发起 / 取消一次教学求助测试消息
+  GET  /api/help/poll?device_id=X 板子轮询：查看者回应了吗？被取消了吗？
+  GET  /api/help?device_id=X&limit=N  网页列出求助事件
+  POST /api/help/answer           查看者回应（携带 answered_by / answer_text）
+  POST /api/help/cancel           查看者取消
+
+  ★ 核心：一次求助里同时存在**三个来源不同、谁也替不了谁**的事实，分三列存：
+      device_state  ① 本地确认  —— 板子自报（板子的钟）
+      server_state  ② VPS 接收  —— 服务端自判（服务端的钟，received_at）
+      viewer_state  ③ 查看者回应 —— 网页前的人（人的动作时刻）
+    压成一个 state 就会重演第2周"旧值冒充"那类错误：
+    拿一个来源的事实去冒充另一个来源的事实。
+
+  另外两条刻意定下的规则：
+    · 已回应的求助**不能被取消** —— 回应是既成事实，不能让发起方单方面抹掉；
+    · 超时只改 server_state，**不动 device_state / viewer_state** ——
+      「没人回应」是服务端的判断，不等于「板子没发出来」，也不等于「人拒绝了」。
+
   状态集合：PENDING → RECEIVED → EXECUTING → UPLOADED → COMPLETED
             分支：EXPIRED（TTL 内无人取）/ TIMEOUT（取了没回传）/ FAILED（设备报错或证据不足）
+
+【第4周】自然语言查询与请求采集（把上面的接口封装成受限工具，交给运行时模型调用）：
+  POST /api/ask                   一句话进，一个带证据的回答出（含工具调用链与守卫标记）
+  GET  /api/ask/health            运行时语言服务（Ollama）在不在、模型有没有
+
+  ★ 两个角色必须分清：
+      开发助手（写这份代码的 AI）—— 开发期参与写代码，用户看不到它；
+      产品运行时模型（Ollama）    —— 运行期被 /api/ask 调用，只看得见受限工具。
+    模型不知道的事，只能靠**工具返回的结构化结果**告诉它，所以工具返回什么，
+    决定了它有没有可能说实话。
+
+  ★ 四条硬约束（都在 nl_agent.py 里，且有自测守着）：
+      1. 受限工具：只能调白名单里的 7 个工具，没有自由写 SQL 的能力；
+         只读守卫拦 INSERT/UPDATE/DELETE/DROP，行数上限由服务端定不由模型定。
+      2. 防假成功：request_capture 下完指令只会返回 PENDING，
+         `success_claim_allowed=False`；**没有 COMPLETED 证据时不许说"已采集成功"**。
+         模型硬说也没用 —— guard_answer() 会在最终文案上再拦一道。
+      3. 歧义不猜：设备不唯一 → 返回 needs_clarification + 候选清单，要求反问用户。
+      4. 必须报来源/时间/状态：每个工具结果都带 source / time / state 三要素。
 
   ★ 核心原则：UPLOADED ≠ COMPLETED。
     收到一张图不代表它就是这次要的那张，必须通过三条证据校验才算完成：
@@ -44,6 +82,7 @@ import socket
 import sqlite3
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -59,6 +98,16 @@ PORT = int(os.environ.get("PORT") or 8000)  # 可用环境变量 PORT 覆盖，�
 TZ = timezone(timedelta(hours=8))  # 东八区，与板端时间口径一致
 MAX_BODY = 64 * 1024               # /api/ingest 的 JSON 上限
 MAX_FRAME = 1 * 1024 * 1024        # /api/frame 的单帧 JPEG 上限（1MB）
+
+# ---- 第4周：运行时语言服务（自然语言 → 受限工具 → 结构化回答）----
+# 刻意用 try/except 包住：Ollama 没装、模型没拉，都不该让整个服务起不来。
+# 前两周的功能与语言服务无关，谁都不能因为对方挂掉而不可用。
+try:
+    import nl_agent                       # noqa: E402
+    NL_IMPORT_ERR = None
+except Exception as _nl_err:              # noqa: BLE001
+    nl_agent = None
+    NL_IMPORT_ERR = "%s: %s" % (type(_nl_err).__name__, _nl_err)
 
 # ---- 第2周：指令通道的时间参数 ----
 DEFAULT_TTL_S = 120                # 指令有效期：这么久没人取走 -> EXPIRED
@@ -81,6 +130,43 @@ ST_COMPLETED = "COMPLETED"  # 三条证据校验通过
 ST_EXPIRED   = "EXPIRED"    # TTL 内无人取走
 ST_TIMEOUT   = "TIMEOUT"    # 已取走但超时未回传
 ST_FAILED    = "FAILED"     # 设备显式报错，或证据校验不通过
+
+# ---- 第3周：按键求助事件的三层状态 ----
+# 三层分别由三个不同的主体产生，**任何一层都不能替另一层作证**：
+#   DEV_*  板端自报（板子自己的钟）
+#   SRV_*  服务端自己判定（服务端自己的钟）
+#   VWR_*  查看者（网页前的人）的动作
+HELP_DEV_LOCAL_ACKED = "LOCAL_ACKED"   # ① 板端：按键已受理
+HELP_DEV_SENDING     = "SENDING"       # 板端：正在发给 VPS
+HELP_DEV_ACCEPTED    = "ACCEPTED"      # 板端：已收到服务端回执
+HELP_DEV_FAILED      = "FAILED"        # 板端：没发出去
+
+HELP_SRV_RECEIVED    = "RECEIVED"      # ② 服务端：确认收到（时间戳由服务端自己打）
+HELP_SRV_CANCELLED   = "CANCELLED"     # 服务端：已取消（不再接受回应）
+HELP_SRV_EXPIRED     = "EXPIRED"       # 服务端：超时无人回应
+
+HELP_VWR_PENDING     = "PENDING"       # ③ 查看者：还没回应
+HELP_VWR_ANSWERED    = "ANSWERED"      # 查看者：已回应
+HELP_VWR_IGNORED     = "IGNORED"       # 查看者：显式忽略
+
+# 求助事件的有效期：超过这么久没人回应，服务端把它标成 EXPIRED。
+# 注意这只改 server_state，**不动 device_state 和 viewer_state** ——
+# "没人回应"是服务端的判断，不等于"板子没发出来"，也不等于"人拒绝了"。
+HELP_TTL_S = 300
+
+# 中文标签：网页直接用，避免前端再维护一份映射
+HELP_LABEL = {
+    HELP_DEV_LOCAL_ACKED: "① 本地已确认（板端按键受理）",
+    HELP_DEV_SENDING:     "板端发送中",
+    HELP_DEV_ACCEPTED:    "板端已收到回执",
+    HELP_DEV_FAILED:      "板端发送失败",
+    HELP_SRV_RECEIVED:    "② VPS 已接收",
+    HELP_SRV_CANCELLED:   "已取消（不再接受回应）",
+    HELP_SRV_EXPIRED:     "已过期（无人回应）",
+    HELP_VWR_PENDING:     "③ 等待查看者回应",
+    HELP_VWR_ANSWERED:    "③ 查看者已回应",
+    HELP_VWR_IGNORED:     "查看者已忽略",
+}
 
 _db_lock = threading.Lock()
 
@@ -192,6 +278,50 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_commands_dev "
             "ON commands(device_id, id)"
         )
+
+        # 第3周：按键求助事件。
+        #
+        # 【为什么把状态拆成三列，而不是一个 state 字段】
+        #   这是本周的题眼：一次"按键求助"里同时存在三个**来源不同、谁也替不了谁**的事实：
+        #
+        #     device_state  ① 本地确认  —— 板子自己说按键被受理了。只有板子知道。
+        #     server_state  ② VPS 接收  —— 服务端自己说收到了。只有服务端知道，
+        #                                  且时间戳必须由服务端自己打（received_at），
+        #                                  绝不采信板子报上来的时间。
+        #     viewer_state  ③ 查看者回应 —— 网页前的人点了回应。只有人知道。
+        #
+        #   如果压成一个 state，就会出现"服务端收到就算完成"这种偷换 ——
+        #   那正是第2周"旧值冒充"的同类错误：拿一个来源的事实去冒充另一个来源的事实。
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS help_events(
+                event_id      TEXT PRIMARY KEY,
+                device_id     TEXT NOT NULL,
+                kind          TEXT,
+                device_state  TEXT,      -- ① 板端自报
+                server_state  TEXT,      -- ② 服务端自己判定
+                viewer_state  TEXT,      -- ③ 查看者侧
+                pressed_at    TEXT,      -- 板端时钟：按下时刻
+                local_ack_at  TEXT,      -- 板端时钟：本地确认时刻
+                sent_at       TEXT,      -- 板端时钟：发出时刻
+                received_at   TEXT,      -- 服务端时钟：入库时刻（★ 服务端自己打）
+                answered_at   TEXT,      -- 查看者动作时刻
+                cancelled_at  TEXT,
+                answered_by   TEXT,
+                answer_text   TEXT,
+                cancelled_by  TEXT,      -- device / viewer —— 谁取消的必须记清
+                cancel_reason TEXT,
+                boot_id       TEXT,
+                seq           INTEGER,
+                reason        TEXT,      -- 失败原因等
+                updated_at    TEXT
+            )"""
+        )
+        conn.execute(
+            # 注意：help_events 用 event_id(TEXT) 做主键，没有自增 id 列，
+            # 排序只能按 received_at（服务端时钟）。别照抄 commands 表的 (device_id, id)。
+            "CREATE INDEX IF NOT EXISTS idx_help_dev "
+            "ON help_events(device_id, received_at DESC)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -199,6 +329,65 @@ def init_db() -> None:
 
 def row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
+
+
+# ---------------- 第3周：求助事件的公共逻辑 ----------------
+
+def help_row_out(row) -> dict:
+    """把一行求助事件整理成网页与板子都能直接用的形状。
+
+    关键点：**三层状态各自带标签，三层时间戳按来源分组**。
+    网页上必须能一眼看出"这个时刻是谁打的表" ——
+    这正是本周要求「本地 / VPS / 查看者三种状态可区分」的落点。
+    """
+    if row is None:
+        return None
+    d = dict(row)
+    d["device_label"] = HELP_LABEL.get(row["device_state"],
+                                       row["device_state"] or "-")
+    d["server_label"] = HELP_LABEL.get(row["server_state"],
+                                       row["server_state"] or "-")
+    d["viewer_label"] = HELP_LABEL.get(row["viewer_state"],
+                                       row["viewer_state"] or "-")
+    # 三种时钟分开列，绝不合并成一个"时间" —— 合并了就没法判断谁在撒谎
+    d["clock_sources"] = {
+        "device": {"pressed_at": row["pressed_at"],
+                   "local_ack_at": row["local_ack_at"]},
+        "server": {"received_at": row["received_at"]},
+        "viewer": {"answered_at": row["answered_at"],
+                   "answered_by": row["answered_by"]},
+    }
+    d["answerable"] = (row["server_state"] == HELP_SRV_RECEIVED
+                       and row["viewer_state"] == HELP_VWR_PENDING)
+    if row["viewer_state"] == HELP_VWR_ANSWERED:
+        d["stage"] = "已完成：查看者已回应"
+    elif row["server_state"] == HELP_SRV_CANCELLED:
+        d["stage"] = "已取消（由 %s 取消）" % (row["cancelled_by"] or "?")
+    elif row["server_state"] == HELP_SRV_EXPIRED:
+        d["stage"] = "已过期：服务端收到了，但一直没人回应"
+    elif row["server_state"] == HELP_SRV_RECEIVED:
+        d["stage"] = "等待查看者回应（VPS 已接收）"
+    else:
+        d["stage"] = "未知"
+    return d
+
+
+def sweep_help_events(conn) -> int:
+    """把超时无人回应的求助标成 EXPIRED。
+
+    只改 server_state，**不动 device_state / viewer_state**：
+    「没人回应」是服务端的判断，既不等于「板子没发出来」，也不等于「人拒绝了」。
+    三者压成一个字段的话，排障方向立刻就偏了 —— 这是第2周
+    「EXPIRED 找人 / TIMEOUT 找活」那条归因原则在求助通道上的同一套逻辑。
+    """
+    cutoff = (datetime.now(TZ) - timedelta(seconds=HELP_TTL_S)).isoformat()
+    cur = conn.execute(
+        "UPDATE help_events SET server_state=?, updated_at=? "
+        "WHERE server_state=? AND viewer_state=? AND received_at < ?",
+        (HELP_SRV_EXPIRED, now_iso(), HELP_SRV_RECEIVED, HELP_VWR_PENDING, cutoff))
+    if cur.rowcount:
+        conn.commit()
+    return cur.rowcount
 
 
 # ---------------- 第2周：指令通道的公共逻辑 ----------------
@@ -439,8 +628,37 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 精简日志
         print("[%s] %s" % (now_iso(), fmt % args), flush=True)
 
+    # ---------- 异常兜底 ----------
+    def _handle_unexpected(self, method: str) -> None:
+        """任何 handler 抛异常都要留下痕迹。
+
+        【为什么必须有这个】
+        之前踩过：handler 里抛异常 → HTTP 层直接断连接，客户端只看到
+        `RemoteDisconnected: Remote end closed connection without response`，
+        服务端这边连一行日志都没有，只能靠猜。同类事故还有 `_send_json`
+        漏写响应体（服务端打印 200，客户端 IncompleteRead）——
+        共同点是「错误发生在响应写出之后/之外」，所以必须在分发层兜住。
+        """
+        tb = traceback.format_exc()
+        print("[%s] !! %s 处理请求时未捕获异常：\n%s" % (now_iso(), method, tb),
+              flush=True)
+        try:
+            self._send_json({"error": "服务器内部错误",
+                             "detail": tb.strip().splitlines()[-1],
+                             "hint": "详见服务端日志"}, 500)
+        except Exception:      # 响应已经开始写了就救不回来了
+            pass
+
     # ---------- GET ----------
     def do_GET(self):
+        try:
+            self._route_get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:                              # noqa: BLE001
+            self._handle_unexpected("GET")
+
+    def _route_get(self):
         path = urlparse(self.path).path
         q = self._query()
         if path == "/":
@@ -465,6 +683,12 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_command_status(q)
         elif path == "/api/command/frame":
             self._handle_command_frame(q)
+        elif path == "/api/help":
+            self._handle_help_list(q)
+        elif path == "/api/help/poll":
+            self._handle_help_poll(q)
+        elif path == "/api/ask/health":
+            self._handle_ask_health()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -734,6 +958,296 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_image_file(path)
 
+    # ---------- 第3周：按键求助事件（三层状态） ----------
+    def _handle_help_submit(self) -> None:
+        """板子发起 / 取消一次教学求助测试消息。
+
+        服务端在这里只做两件事：
+          1) **如实记录**板端自报的 device_state 与板端时刻（不采信、不修改、不代填）；
+          2) 打上**自己的** received_at —— 这是「VPS 已接收」唯一的证据来源。
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+        device_id = str(data.get("device_id") or "").strip()
+        event_id = str(data.get("event_id") or "").strip()
+        action = str(data.get("action") or "request").strip()
+        if not device_id or not event_id:
+            self._send_json({"error": "device_id 与 event_id 均为必填"}, 400)
+            return
+        if action not in ("request", "cancel"):
+            self._send_json({"error": "action 只能是 request 或 cancel"}, 400)
+            return
+
+        now = now_iso()      # ★ 服务端自己的钟，与板端上报的时间戳分开存
+        with _db_lock:
+            conn = get_db()
+            try:
+                row = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+                if action == "request":
+                    if row is None:
+                        conn.execute(
+                            "INSERT INTO help_events(event_id, device_id, kind, "
+                            "device_state, server_state, viewer_state, pressed_at, "
+                            "local_ack_at, sent_at, received_at, boot_id, seq, "
+                            "updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (event_id, device_id,
+                             str(data.get("kind") or "teach_help_test"),
+                             # 板端自报的状态：原样记录，服务端不替它编
+                             str(data.get("device_state") or HELP_DEV_LOCAL_ACKED),
+                             HELP_SRV_RECEIVED, HELP_VWR_PENDING,
+                             str(data.get("pressed_at") or ""),
+                             str(data.get("local_ack_at") or ""),
+                             now, now,
+                             str(data.get("boot_id") or ""), data.get("seq"), now))
+                        conn.commit()
+                    else:
+                        # 同一条事件重复上报：只在未终结时刷新板端字段，不覆盖服务端判定
+                        if row["server_state"] not in (HELP_SRV_CANCELLED,
+                                                       HELP_SRV_EXPIRED):
+                            conn.execute(
+                                "UPDATE help_events SET device_state=?, pressed_at=?, "
+                                "local_ack_at=?, updated_at=? WHERE event_id=?",
+                                (str(data.get("device_state") or row["device_state"]),
+                                 str(data.get("pressed_at") or row["pressed_at"]),
+                                 str(data.get("local_ack_at") or row["local_ack_at"]),
+                                 now, event_id))
+                            conn.commit()
+                    out = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                       (event_id,)).fetchone()
+                    self._send_json({"ok": True, "help": help_row_out(out)}, 201)
+                    return
+
+                # ---- action == "cancel" ----
+                if row is None:
+                    self._send_json({"error": "没有这条求助事件，无法取消"}, 404)
+                    return
+                if row["viewer_state"] == HELP_VWR_ANSWERED:
+                    # 已经有人回应过了。回应是既成事实，不能被撤销 ——
+                    # 否则「查看者回应」这条证据就可以被发起方单方面抹掉。
+                    self._send_json(
+                        {"error": "该求助已被回应，不能再取消",
+                         "help": help_row_out(row)}, 409)
+                    return
+                if row["server_state"] == HELP_SRV_CANCELLED:
+                    # 幂等：重复取消返回当前状态，不算错误
+                    self._send_json({"ok": True, "help": help_row_out(row),
+                                     "note": "该求助此前已取消"}, 200)
+                    return
+                conn.execute(
+                    "UPDATE help_events SET server_state=?, device_state=?, "
+                    "cancelled_at=?, cancelled_by=?, cancel_reason=?, updated_at=? "
+                    "WHERE event_id=?",
+                    (HELP_SRV_CANCELLED,
+                     str(data.get("device_state") or HELP_DEV_FAILED),
+                     now, str(data.get("cancelled_by") or "device"),
+                     str(data.get("reason") or ""), now, event_id))
+                conn.commit()
+                out = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+                self._send_json({"ok": True, "help": help_row_out(out)}, 200)
+            finally:
+                conn.close()
+
+    def _handle_help_poll(self, q: dict) -> None:
+        """板子轮询：查看者回应了吗？被别人取消了吗？
+
+        板子只需要**看**，不需要猜 —— 回应与否完全由服务端这条记录说话。
+        """
+        device_id = (q.get("device_id") or [""])[0]
+        event_id = (q.get("event_id") or [""])[0]
+        if not device_id:
+            self._send_json({"error": "device_id 为必填"}, 400)
+            return
+        conn = get_db()
+        try:
+            if event_id:
+                row = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM help_events WHERE device_id=? "
+                    "ORDER BY received_at DESC, event_id DESC LIMIT 1",
+                    (device_id,)).fetchone()
+            self._send_json({"help": help_row_out(row) if row else None,
+                             "server_now": now_iso()})
+        finally:
+            conn.close()
+
+    # ---------- 第4周：自然语言问答（受限工具 + 运行时模型）----------
+    def _handle_ask_health(self) -> None:
+        """网页用它判断"运行时语言服务到底在不在"，而不是让用户瞎等。"""
+        if nl_agent is None:
+            self._send_json({"ok": False, "error": NL_IMPORT_ERR,
+                             "hint": "nl_agent.py 没能导入，自然语言功能不可用"}, 200)
+            return
+        info = nl_agent.model_available()
+        info["hint"] = ("运行时模型已就绪" if info.get("ok")
+                        else "Ollama 在跑但没找到指定模型，可先 ollama pull")
+        self._send_json(info, 200)
+
+    def _handle_ask(self) -> None:
+        """一句话进来，一个带证据的回答出去。
+
+        注意这里**不做任何"帮模型兜底"的事** —— 模型说什么、工具查到什么，
+        原样返回（含 guardrails 标记）。服务端替模型编答案，就等于把
+        "无证据不报成功"这条底线拆了。
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+        question = str(data.get("question") or "").strip()
+        if not question:
+            self._send_json({"error": "question 为必填"}, 400)
+            return
+        if len(question) > 500:
+            self._send_json({"error": "问题太长了（上限 500 字）"}, 400)
+            return
+        if nl_agent is None:
+            self._send_json({"error": "运行时语言服务不可用",
+                             "detail": NL_IMPORT_ERR}, 503)
+            return
+        # 让工具层用**本进程认准的**数据库，避免两边 DATA_DIR 不一致
+        # 导致"网页查得到、问答查不到"这种莫名其妙的差异。
+        nl_agent.DB_PATH = DB_PATH
+        try:
+            res = nl_agent.ask(question)
+        except Exception as e:                              # noqa: BLE001
+            traceback.print_exc()
+            self._send_json({"error": "调用运行时模型失败：%s: %s"
+                                      % (type(e).__name__, e)}, 502)
+            return
+        print("[%s] 自然语言问答：%r → 工具 %d 次，守卫 %s"
+              % (now_iso(), question[:40], len(res.get("tool_calls") or []),
+                 res.get("guardrails") or "未触发"), flush=True)
+        self._send_json(res, 200)
+
+    def _handle_help_list(self, q: dict) -> None:
+        """网页：列出求助事件（新→旧）。"""
+        device_id = (q.get("device_id") or [""])[0]
+        try:
+            limit = int((q.get("limit") or ["20"])[0])
+        except ValueError:
+            limit = 20
+        limit = max(1, min(200, limit))
+        conn = get_db()
+        try:
+            if device_id:
+                rows = conn.execute(
+                    "SELECT * FROM help_events WHERE device_id=? "
+                    "ORDER BY received_at DESC, event_id DESC LIMIT ?",
+                    (device_id, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM help_events "
+                    "ORDER BY received_at DESC, event_id DESC LIMIT ?",
+                    (limit,)).fetchall()
+            pending = conn.execute(
+                "SELECT COUNT(*) c FROM help_events WHERE viewer_state=? "
+                "AND server_state=?", (HELP_VWR_PENDING, HELP_SRV_RECEIVED)
+            ).fetchone()["c"]
+            self._send_json({
+                "helps": [help_row_out(r) for r in rows],
+                "pending_count": pending,
+                "server_now": now_iso(),
+            })
+        finally:
+            conn.close()
+
+    def _handle_help_answer(self) -> None:
+        """查看者（网页前的人）回应一条求助。
+
+        这是「③ 查看者回应」唯一的产生方式 —— 服务端、板端都不能代替它发生。
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+        event_id = str(data.get("event_id") or "").strip()
+        if not event_id:
+            self._send_json({"error": "event_id 为必填"}, 400)
+            return
+        answered_by = str(data.get("answered_by") or "viewer").strip() or "viewer"
+        answer_text = str(data.get("answer_text") or "").strip()
+
+        now = now_iso()
+        with _db_lock:
+            conn = get_db()
+            try:
+                row = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+                if row is None:
+                    self._send_json({"error": "没有这条求助事件"}, 404)
+                    return
+                # 先确认事件存在，再校验回应内容。
+                # 顺序反过来的话，"回应一个不存在的求助"会得到 400「内容为空」——
+                # 把一个"资源不存在"报成了"参数不合法"，排查时会指错方向。
+                if not answer_text:
+                    self._send_json({"error": "回应内容不能为空（空回应等于没回应）"},
+                                    400)
+                    return
+                if row["server_state"] == HELP_SRV_CANCELLED:
+                    self._send_json({"error": "该求助已被取消，不能再回应",
+                                     "help": help_row_out(row)}, 409)
+                    return
+                if row["server_state"] == HELP_SRV_EXPIRED:
+                    self._send_json({"error": "该求助已过期，不能再回应",
+                                     "help": help_row_out(row)}, 409)
+                    return
+                if row["viewer_state"] == HELP_VWR_ANSWERED:
+                    self._send_json({"error": "该求助已经回应过了",
+                                     "help": help_row_out(row)}, 409)
+                    return
+                conn.execute(
+                    "UPDATE help_events SET viewer_state=?, answered_at=?, "
+                    "answered_by=?, answer_text=?, updated_at=? WHERE event_id=?",
+                    (HELP_VWR_ANSWERED, now, answered_by, answer_text, now, event_id))
+                conn.commit()
+                out = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+                self._send_json({"ok": True, "help": help_row_out(out)}, 200)
+            finally:
+                conn.close()
+
+    def _handle_help_cancel_by_viewer(self) -> None:
+        """查看者取消一条求助（与板端按键取消走同一张表，但 cancelled_by 不同）。"""
+        data = self._read_json_body()
+        if data is None:
+            return
+        event_id = str(data.get("event_id") or "").strip()
+        if not event_id:
+            self._send_json({"error": "event_id 为必填"}, 400)
+            return
+        now = now_iso()
+        with _db_lock:
+            conn = get_db()
+            try:
+                row = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+                if row is None:
+                    self._send_json({"error": "没有这条求助事件"}, 404)
+                    return
+                if row["viewer_state"] == HELP_VWR_ANSWERED:
+                    self._send_json({"error": "该求助已被回应，不能再取消",
+                                     "help": help_row_out(row)}, 409)
+                    return
+                if row["server_state"] == HELP_SRV_CANCELLED:
+                    self._send_json({"ok": True, "help": help_row_out(row),
+                                     "note": "该求助此前已取消"}, 200)
+                    return
+                conn.execute(
+                    "UPDATE help_events SET server_state=?, cancelled_at=?, "
+                    "cancelled_by=?, cancel_reason=?, updated_at=? WHERE event_id=?",
+                    (HELP_SRV_CANCELLED, now, "viewer",
+                     str(data.get("reason") or "viewer_cancelled"), now, event_id))
+                conn.commit()
+                out = conn.execute("SELECT * FROM help_events WHERE event_id=?",
+                                   (event_id,)).fetchone()
+                self._send_json({"ok": True, "help": help_row_out(out)}, 200)
+            finally:
+                conn.close()
+
     # ---------- 第2周：远程采集指令 ----------
     def _handle_command_create(self) -> None:
         """网页下发一条采集指令。
@@ -927,6 +1441,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- POST ----------
     def do_POST(self):
+        try:
+            self._route_post()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:                              # noqa: BLE001
+            self._handle_unexpected("POST")
+
+    def _route_post(self):
         path = urlparse(self.path).path
         if path == "/api/frame":
             self._handle_frame()
@@ -936,6 +1458,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/command/ack":
             self._handle_command_ack()
+            return
+        if path == "/api/help":
+            self._handle_help_submit()
+            return
+        if path == "/api/help/answer":
+            self._handle_help_answer()
+            return
+        if path == "/api/help/cancel":
+            self._handle_help_cancel_by_viewer()
+            return
+        if path == "/api/ask":
+            self._handle_ask()
             return
         if path != "/api/ingest":
             self._send_json({"error": "not found"}, 404)
@@ -1144,11 +1678,15 @@ def command_sweeper() -> None:
                 conn = get_db()
                 try:
                     n = sweep_commands(conn)
+                    m = sweep_help_events(conn)     # 第3周：超时无人回应的求助
                 finally:
                     conn.close()
             if n:
                 print("[%s] 后台扫描：%d 条指令超时（转 EXPIRED / TIMEOUT）"
                       % (now_iso(), n), flush=True)
+            if m:
+                print("[%s] 后台扫描：%d 条求助超时无人回应（转 EXPIRED，"
+                      "板端与查看者状态不动）" % (now_iso(), m), flush=True)
         except Exception as e:      # 后台线程绝不能因异常退出
             print("[%s] 后台扫描异常: %s" % (now_iso(), e), flush=True)
 
@@ -1169,6 +1707,19 @@ def main() -> None:
           flush=True)
     print("  指令通道:  POST /api/command | GET /api/command/poll"
           " | POST /api/command/ack | GET /api/command/status", flush=True)
+    print("  按键求助:  POST /api/help(发起/取消) | GET /api/help/poll(板端轮询)"
+          " | GET /api/help(网页列表) | POST /api/help/answer"
+          " | POST /api/help/cancel", flush=True)
+    if nl_agent is None:
+        print("  自然语言:  ✗ 不可用（nl_agent.py 导入失败：%s）" % NL_IMPORT_ERR,
+              flush=True)
+    else:
+        info = nl_agent.model_available()
+        print("  自然语言:  %s | POST /api/ask | 模型 %s"
+              % ("✓ 运行时模型已就绪" if info.get("ok")
+                 else "△ 语言服务未就绪（%s）" % (info.get("error")
+                                              or "模型未找到"), nl_agent.OLLAMA_MODEL),
+              flush=True)
     print("=" * 60, flush=True)
     httpd.serve_forever()
 

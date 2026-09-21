@@ -106,6 +106,70 @@
     position: absolute; bottom: 20px; left: 0; right: 0; text-align: center;
     font-size: 12px; color: var(--dim); padding: 0 20px;
   }
+  /* ---- 第3周：按键求助（三层状态必须能分别看出"是谁说的"）---- */
+  .helpbar {
+    display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
+    font-size: 12px; color: var(--dim); margin-bottom: 12px;
+  }
+  .helpbar b { color: var(--txt); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .helpbar button { padding: 4px 10px; }
+  .help-list { display: flex; flex-direction: column; gap: 12px; }
+  .hevent {
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .hevent.answered  { border-color: var(--ok); }
+  .hevent.cancelled, .hevent.expired { opacity: .72; }
+  .hevent header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .hevent .hstage { font-size: 12px; color: var(--dim); margin: 9px 0 10px; }
+  .hgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .hcell {
+    border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px;
+    padding: 9px 11px; background: var(--card);
+  }
+  .hcell.l1 { border-left-color: var(--warn); }
+  .hcell.l2 { border-left-color: var(--info); }
+  .hcell.l3 { border-left-color: var(--ok); }
+  .hcell .hwho  { font-size: 11px; color: var(--dim); }
+  .hcell .hval  { font-size: 13px; margin-top: 5px; }
+  .hcell .htime { font-size: 11px; color: var(--dim); margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .hcell .hclock { font-size: 10px; color: var(--dim); opacity: .78; margin-top: 2px; }
+  .hacts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .hacts input {
+    background: var(--card); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 9px; font-size: 12px;
+  }
+  .hacts input.hwho-in { width: 110px; }
+  .hacts input.htext-in { flex: 1 1 220px; min-width: 160px; }
+  .hacts button:disabled { opacity: .45; cursor: not-allowed; }
+  .hacts .hint { font-size: 11px; color: var(--dim); }
+  .hans { margin-top: 9px; font-size: 12px; border-left: 3px solid var(--ok); padding-left: 10px; }
+  .hans .who { color: var(--dim); font-size: 11px; }
+  /* ---- 第4周：自然语言问答（运行时模型 + 受限工具）---- */
+  .askbar {
+    display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+    font-size: 12px; color: var(--dim); margin-bottom: 12px;
+  }
+  .askrow { display: flex; gap: 8px; }
+  .askrow input {
+    flex: 1 1 auto; min-width: 180px; background: var(--card); color: var(--txt);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 13px;
+  }
+  .askquick { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+  .askquick button { font-size: 12px; padding: 4px 10px; }
+  .asklog { margin-top: 14px; display: flex; flex-direction: column; gap: 12px; }
+  .qa { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .qa .q { font-size: 13px; margin-bottom: 9px; color: var(--txt); }
+  .qa .q b { color: var(--dim); font-weight: 500; }
+  .qa .a { font-size: 13px; white-space: pre-wrap; line-height: 1.75; }
+  .qa.waiting .a { color: var(--dim); }
+  .qa .chain { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
+  .qa .chain .ct { font-size: 11px; color: var(--dim); margin-bottom: 5px; }
+  .qa .chain div.c1 { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; padding: 2px 0; }
+  .qa .chain .cname { color: var(--txt); }
+  .qa .flags { margin-top: 9px; }
+  .qa .flags .badge { margin-right: 6px; }
+  .qa .note { font-size: 11px; color: var(--dim); margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -157,6 +221,55 @@
   </table>
 
   <section class="cam">
+    <div class="label">教学求助 · 板子按键发起、由人来回应（第3周）—— 三层状态各由不同来源说了算，谁也替不了谁</div>
+    <div class="helpbar">
+      <span>待回应 <b id="helpPending">0</b></span>
+      <span>共 <b id="helpTotal">0</b> 条</span>
+      <button id="helpRefresh">刷新求助</button>
+      <span class="code">GET /api/help</span>
+    </div>
+    <div class="help-list" id="helpList"><div class="code">加载中…</div></div>
+    <div class="camnote">
+      三层状态刻意分开存，不压成一个 state：<b>① 本地确认</b>只有板子知道（板子的钟），
+      <b>② VPS 接收</b>只有服务端知道（服务端的钟，板子报上来的时间一律只当"板子的一面之词"存着，不参与判定），
+      <b>③ 查看者回应</b>只有人知道。<br>
+      两条规则：已回应的求助不能再取消（回应是既成事实，不能让发起方单方面抹掉）；超时只把
+      server_state 改成 EXPIRED，device_state / viewer_state 一动不动 —— 「没人回应」是服务端的判断，
+      不等于「板子没发出来」，也不等于「人拒绝了」。
+    </div>
+  </section>
+
+  <section class="cam">
+    <div class="label">自然语言问答 · 一句话 → 受限工具 → 带证据的回答（第4周）</div>
+    <div class="askbar">
+      <span class="badge" id="askModelState">检测运行时语言服务…</span>
+      <span class="code" id="askModelName">--</span>
+      <span class="code">POST /api/ask</span>
+    </div>
+    <div class="askrow">
+      <input id="askInput" placeholder="用一句话问，例如：板子最近一次的加速度是多少">
+      <button id="askBtn">问</button>
+    </div>
+    <div class="askquick">
+      <button data-q="有哪些设备">有哪些设备</button>
+      <button data-q="板子最近一次的加速度是多少">最新读数</button>
+      <button data-q="s3eye-group01 最近一小时有多少条数据，ax 最大值是多少">带时间范围查询</button>
+      <button data-q="有没有待回应的教学求助">待回应的求助</button>
+      <button data-q="让板子现在拍一张，然后告诉我拍好了没">★ 请求一次新采集</button>
+    </div>
+    <div class="asklog" id="askLog"></div>
+    <div class="camnote">
+      这一块由**产品运行时模型**（本机 Ollama）驱动，和写这份代码的开发助手是两个角色 ——
+      它只看得见 7 个受限工具，看不见仓库、也看不见开发期的对话。
+      所以每个回答下面都挂着**工具调用链**：调了哪个工具、参数是什么、数据来自哪个接口、
+      什么时刻、什么状态。没有调用链的回答，就是没有依据的回答。<br>
+      ★ 特别注意「请求一次新采集」：下完指令只会得到 <b>PENDING</b>（设备还没来取），
+      <b>在没有 COMPLETED 证据之前，它不会说"已采集成功"</b>。
+      如果模型硬说，出口守卫会把那句话拦下来并替换成实际状态。
+    </div>
+  </section>
+
+  <section class="cam">
     <div class="label">照片画廊 · 每一帧都在这里（原图按配额清理，元数据与哈希永久保留）</div>
     <div class="galbar">
       <span>共 <b id="galTotal">0</b> 帧</span>
@@ -183,7 +296,10 @@
 
   <div class="note">说明：本页数值全部来自服务器查询接口 /api/latest 与 /api/history，不含任何写死的演示数据。停止采集后，页面将保留最后一条记录的时间并提示"数据未更新"。摄像头画面来自 /api/frame/latest，开发板停止上传后定格在最后一帧。<br>
   远程采集区与上面的周期数据是两条独立通道：暂停刷新只停住上面的数据视图，指令通道照常工作 —— 这正是「暂停周期上报后，命令触发仍能出新数据」要验证的行为。请求编号 / 采集时刻 / 开机标识+序号 这三组信息就是用来回答"这张图到底是不是这次拍的"。<br>
-  照片画廊的数据来自 /api/frames：每帧都记下 SHA-256、分辨率、字节数与来源；原图超过保留期会被后台清理（默认 7 天，可用环境变量 RETENTION_DAYS 调整），但**元数据与哈希永久保留**，所以已清理的帧在列表里依然可查、可校验。</div>
+  照片画廊的数据来自 /api/frames：每帧都记下 SHA-256、分辨率、字节数与来源；原图超过保留期会被后台清理（默认 7 天，可用环境变量 RETENTION_DAYS 调整），但**元数据与哈希永久保留**，所以已清理的帧在列表里依然可查、可校验。<br>
+  教学求助区来自 /api/help，方向和第2周相反：**板子主动发起，人来回应**。三条状态格子里的时刻来自三个不同的钟 ——
+  板子的钟、服务端的钟、人的动作时刻。服务端只把板子报的时间当"板子的一面之词"存着，判定一律用自己打的时间戳。
+  已回应的求助不能再取消；超时只把服务端状态标成 EXPIRED，板子侧与查看者侧原样不动。</div>
 
 <script>
 (function () {
@@ -529,6 +645,240 @@
   }
   setInterval(refreshCam, 1500);
   refreshCam();
+
+  // ---- 第3周：教学求助（三层状态）----
+  // 这一块只干一件事：把三个来源的事实**分别**摆出来，不做任何合并或推断。
+  // 板子说板子的、服务端说服务端的、人说人的 —— 页面替任何一方说话都是造假。
+  var HELP_MS = 3000;
+
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function shortTime(v) {
+    if (!v) return '--';
+    var m = String(v).match(/T(\d{2}:\d{2}:\d{2})/);
+    return m ? m[1] : String(v);
+  }
+
+  function helpCls(h) {
+    if (h.viewer_state === 'ANSWERED') return 'answered';
+    if (h.server_state === 'CANCELLED') return 'cancelled';
+    if (h.server_state === 'EXPIRED') return 'expired';
+    return '';
+  }
+
+  function renderHelp(data) {
+    var list = data.helps || [];
+    el('helpPending').textContent = data.pending_count || 0;
+    el('helpTotal').textContent = list.length;
+    var box = el('helpList');
+    if (!list.length) {
+      box.innerHTML = '<div class="code">还没有求助事件。板子短按 GPIO0 发起一次，' +
+        '这里就会出现一条 —— 注意它一定是先有「本地确认」，才有「VPS 接收」。</div>';
+      return;
+    }
+    box.innerHTML = list.map(function (h) {
+      var cs = h.clock_sources || {};
+      var dev = cs.device || {}, srv = cs.server || {}, vwr = cs.viewer || {};
+      var canAnswer = h.answerable === true;
+      // 已回应 / 已取消 / 已过期，都不能再取消 —— 与后端的 409 规则保持一致
+      var canCancel = canAnswer;
+      // 可用时不留空属性（'disabled' / ''），否则会渲染出 <button ... > 这种多余空格
+      var disA = canAnswer ? '' : ' disabled';
+      var disC = canCancel ? '' : ' disabled';
+      var ans = (h.viewer_state === 'ANSWERED')
+        ? '<div class="hans"><div class="who">查看者回应 · ' + esc(h.answered_by || '匿名') +
+          ' · ' + esc(shortTime(vwr.answered_at)) + '</div>' + esc(h.answer_text || '') + '</div>'
+        : '';
+      var hint = '';
+      if (h.server_state === 'CANCELLED') {
+        hint = '已取消（由 ' + esc(h.cancelled_by || '?') + ' 取消），不能再回应';
+      } else if (h.server_state === 'EXPIRED') {
+        hint = '已过期，不能再回应（但板子的本地确认与查看者侧都还在）';
+      } else if (h.viewer_state === 'ANSWERED') {
+        hint = '已回应，不能再取消';
+      }
+      var badgeCls = canAnswer ? 'warn'
+        : (h.viewer_state === 'ANSWERED' ? 'ok'
+          : (h.server_state === 'CANCELLED' || h.server_state === 'EXPIRED' ? 'err' : ''));
+      return '<article class="hevent ' + helpCls(h) + '" data-id="' + esc(h.event_id) + '">' +
+        '<header>' +
+          '<span class="badge info">求助</span>' +
+          '<span class="code">' + esc(h.event_id) + '</span>' +
+          '<span class="code">设备 ' + esc(h.device_id) + '</span>' +
+          (h.boot_id ? '<span class="code">' + esc(h.boot_id) + ' / seq ' + esc(h.seq) + '</span>' : '') +
+          '<span class="badge ' + badgeCls + '">' + esc(h.stage || '') + '</span>' +
+        '</header>' +
+        '<div class="hstage">' + esc(h.stage || '') + '</div>' +
+        '<div class="hgrid">' +
+          '<div class="hcell l1"><div class="hwho">① 本地确认 · 只有板子知道</div>' +
+            '<div class="hval">' + esc(h.device_label) + '</div>' +
+            '<div class="htime">按下 ' + esc(shortTime(dev.pressed_at)) +
+              ' · 确认 ' + esc(shortTime(dev.local_ack_at)) + '</div>' +
+            '<div class="hclock">板子的钟（未对时时是开机秒数）</div></div>' +
+          '<div class="hcell l2"><div class="hwho">② VPS 接收 · 只有服务端知道</div>' +
+            '<div class="hval">' + esc(h.server_label) + '</div>' +
+            '<div class="htime">入库 ' + esc(shortTime(srv.received_at)) + '</div>' +
+            '<div class="hclock">服务端的钟（板子报的时间不参与判定）</div></div>' +
+          '<div class="hcell l3"><div class="hwho">③ 查看者回应 · 只有人知道</div>' +
+            '<div class="hval">' + esc(h.viewer_label) + '</div>' +
+            '<div class="htime">' + (vwr.answered_at ? esc(shortTime(vwr.answered_at)) : '还没人回应') + '</div>' +
+            '<div class="hclock">人的动作时刻</div></div>' +
+        '</div>' +
+        ans +
+        '<div class="hacts">' +
+          '<input class="hwho-in" placeholder="回应人（如 同学B）"' + disA + '>' +
+          '<input class="htext-in" placeholder="回应内容（空回应等于没回应）"' + disA + '>' +
+          '<button data-act="answer"' + disA + '>回应</button>' +
+          '<button data-act="cancel"' + disC + '>取消</button>' +
+          (hint ? '<span class="hint">' + hint + '</span>' : '') +
+        '</div>' +
+      '</article>';
+    }).join('');
+  }
+
+  function refreshHelp() {
+    var dev = el('deviceSelect').value;
+    var q = dev ? ('?device_id=' + encodeURIComponent(dev) + '&limit=20') : '?limit=20';
+    fetch('/api/help' + q).then(function (r) { return r.json(); })
+      .then(renderHelp)
+      .catch(function () { /* 求助拉取失败不打扰主视图，下一轮自愈 */ });
+  }
+
+  el('helpList').addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest('button[data-act]');
+    if (!btn || btn.disabled) return;
+    var card = btn.closest('.hevent');
+    var id = card.getAttribute('data-id');
+    var act = btn.getAttribute('data-act');
+    var who = card.querySelector('.hwho-in').value.trim();
+    var text = card.querySelector('.htext-in').value.trim();
+    var url, body;
+    if (act === 'answer') {
+      if (!text) { alert('回应内容不能为空 —— 空回应等于没回应。'); return; }
+      url = '/api/help/answer';
+      body = { event_id: id, answered_by: who || '网页查看者', answer_text: text };
+    } else {
+      url = '/api/help/cancel';
+      body = { event_id: id, cancelled_by: 'viewer', reason: 'viewer_cancelled' };
+    }
+    btn.disabled = true;
+    fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, code: r.status, d: d }; });
+    }).then(function (res) {
+      if (!res.ok) alert('操作未成功（' + res.code + '）：' + (res.d.error || '未知原因'));
+      refreshHelp();
+    }).catch(function () {
+      btn.disabled = false;
+      alert('请求失败，请确认服务端还在运行。');
+    });
+  });
+
+  el('helpRefresh').addEventListener('click', refreshHelp);
+
+  setInterval(refreshHelp, HELP_MS);
+  refreshHelp();
+
+  // ---- 第4周：自然语言问答 ----
+  // 页面在这里只做三件事：把问题发出去、把回答原样显示、把**工具调用链**摊开。
+  // 最后一件最关键：调用链就是"这句话有没有依据"的证据。
+  // 页面绝不替模型美化措辞，也绝不补一句"应该拍到了" —— 那是造假。
+  var GUARD_LABEL = {
+    success_without_evidence: '已拦下「无证据的假成功」',
+    no_tool_used: '未调用任何工具，数字无来源',
+    clarification_skipped: '该反问却没反问（已补提醒）'
+  };
+
+  function askHealth() {
+    var b = el('askModelState');
+    fetch('/api/ask/health').then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.ok) {
+          b.className = 'badge ok';
+          b.textContent = '运行时模型已就绪';
+        } else {
+          b.className = 'badge err';
+          b.textContent = '语言服务不可用';
+        }
+        el('askModelName').textContent = (d.want || '') + (d.hint ? ' · ' + d.hint : '');
+      })
+      .catch(function () {
+        b.className = 'badge err';
+        b.textContent = '语言服务探测失败';
+        el('askModelName').textContent = '服务端可能没起来';
+      });
+  }
+
+  function renderAsk(question, res) {
+    var chain = (res.tool_calls || []).map(function (t) {
+      return '<div class="c1">· <span class="cname">' + esc(t.tool) + '</span>(' +
+        esc(JSON.stringify(t.args)) + ') → source=' + esc(t.source || '-') +
+        ' · time=' + esc(t.time || '-') + ' · state=' + esc(t.state === null || t.state === undefined ? '-' : t.state) +
+        ' · ok=' + esc(t.ok) + '</div>';
+    }).join('') || '<div class="c1">（没有调用任何工具）</div>';
+
+    var flags = (res.guardrails || []).map(function (g) {
+      return '<span class="badge warn">' + esc(GUARD_LABEL[g] || g) + '</span>';
+    }).join('');
+
+    return '<div class="qa">' +
+      '<div class="q"><b>问：</b>' + esc(question) + '</div>' +
+      '<div class="a">' + esc(res.answer || '（没有回答）') + '</div>' +
+      (flags ? '<div class="flags">' + flags + '</div>' : '') +
+      '<div class="chain"><div class="ct">工具调用链（这条回答的全部依据）</div>' + chain + '</div>' +
+      '<div class="note">' + esc(res.note || '') +
+        (res.completion_evidence ? ' · 本轮存在采集完成证据' : ' · 本轮没有采集完成证据') +
+      '</div>' +
+    '</div>';
+  }
+
+  function askQuestion(question) {
+    var q = (question || el('askInput').value || '').trim();
+    if (!q) return;
+    el('askInput').value = '';
+    var box = el('askLog');
+    var pending = document.createElement('div');
+    pending.className = 'qa waiting';
+    pending.innerHTML = '<div class="q"><b>问：</b>' + esc(q) + '</div>' +
+      '<div class="a">正在调用运行时模型…（本机 27B 模型，首次可能要几十秒）</div>';
+    box.insertBefore(pending, box.firstChild);
+    el('askBtn').disabled = true;
+
+    fetch('/api/ask', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q })
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, code: r.status, d: d }; });
+    }).then(function (res) {
+      var html = res.ok ? renderAsk(q, res.d)
+        : '<div class="qa"><div class="q"><b>问：</b>' + esc(q) + '</div>' +
+          '<div class="a">调用失败（' + res.code + '）：' + esc(res.d.error || '未知原因') +
+          (res.d.detail ? '\n' + esc(res.d.detail) : '') + '</div></div>';
+      var wrap = document.createElement('div');
+      wrap.innerHTML = html;
+      box.replaceChild(wrap.firstChild, pending);
+      el('askBtn').disabled = false;
+      askHealth();
+    }).catch(function (e) {
+      pending.querySelector('.a').textContent = '请求失败：' + e.message;
+      el('askBtn').disabled = false;
+    });
+  }
+
+  el('askBtn').addEventListener('click', function () { askQuestion(); });
+  el('askInput').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') askQuestion();
+  });
+  document.querySelectorAll('.askquick button').forEach(function (b) {
+    b.addEventListener('click', function () { askQuestion(b.getAttribute('data-q')); });
+  });
+  askHealth();
 
   tick();
   setInterval(tick, POLL_MS);
