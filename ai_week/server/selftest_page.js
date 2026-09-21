@@ -1,0 +1,158 @@
+/*
+ * 网页层自测（不启浏览器、不联网）
+ *
+ * 为什么需要它：index.html 里的脚本是浏览器脚本，语法错、id 拼错、
+ * 调了一个后端根本没注册的接口 —— 这三种错在"打开页面看一眼"时
+ * 往往表现为"某一块空白"，很难定位到具体是哪一行。
+ * 本脚本用 Node 把内联脚本抽出来做静态校验，并把渲染函数单独拉出来
+ * 喂样本数据，检查产出的 HTML 是否正确。
+ *
+ * 运行：node selftest_page.js      （需要同目录下有 index.html 与 server.py）
+ */
+'use strict';
+const fs = require('fs');
+const path = require('path');
+
+const HERE = __dirname;
+const html = fs.readFileSync(path.join(HERE, 'index.html'), 'utf8');
+const srv = fs.readFileSync(path.join(HERE, 'server.py'), 'utf8');
+
+let fails = [];
+function check(name, cond, extra) {
+  console.log((cond ? '  [OK]   ' : '  [FAIL] ') + name
+    + (extra !== undefined && extra !== '' ? ' | ' + extra : ''));
+  if (!cond) fails.push(name);
+}
+
+const m = html.match(/<script>([\s\S]*?)<\/script>/);
+if (!m) { console.log('NO_SCRIPT：index.html 里找不到内联脚本'); process.exit(1); }
+const src = m[1];
+
+// ---------- 1. 语法 ----------
+console.log('\n== 1. 内联脚本语法 ==');
+try {
+  new Function(src);
+  check('脚本能通过语法解析', true, src.split('\n').length + ' 行');
+} catch (e) {
+  check('脚本能通过语法解析', false, e.message);
+  process.exit(1);
+}
+
+// ---------- 2. DOM id ----------
+console.log('\n== 2. 脚本引用的 DOM id 都存在 ==');
+const ids = [...new Set([...src.matchAll(/el\('([A-Za-z0-9_]+)'\)/g)].map(x => x[1]))];
+const missing = ids.filter(id => !new RegExp('id="' + id + '"').test(html));
+check('全部 ' + ids.length + ' 个 id 都能在 HTML 里找到', missing.length === 0,
+  missing.join(', '));
+
+// ---------- 3. 接口路由 ----------
+console.log('\n== 3. 页面调用的接口都在 server.py 里注册过 ==');
+const calls = [...new Set([...src.matchAll(/['"](\/api\/[A-Za-z0-9_\/]+)/g)].map(x => x[1]))];
+const notRouted = calls.filter(p => !srv.includes('"' + p + '"'));
+check('全部 ' + calls.length + ' 个接口都有对应路由', notRouted.length === 0,
+  notRouted.join(', '));
+
+// ---------- 4. renderHelp（第3周：三层状态）----------
+console.log('\n== 4. 第3周：求助卡片渲染 ==');
+const startH = src.indexOf('function esc(');
+const endH = src.indexOf('function refreshHelp(');
+if (startH < 0 || endH < 0) { check('能抽出渲染函数', false); }
+const blockH = src.slice(startH, endH);
+
+const els = {};
+function el(id) {
+  return els[id] || (els[id] = { textContent: '', innerHTML: '', value: '', addEventListener() {} });
+}
+const renderHelp = new Function('el', blockH + '\n return renderHelp;')(el);
+
+const base = {
+  event_id: 'help-a1', device_id: 'esp32s3-eye-01', kind: 'teach_help_test',
+  boot_id: 'boot7', seq: 12,
+  clock_sources: {
+    device: { pressed_at: 'up+42.100s(time_not_synced)', local_ack_at: 'up+42.120s(time_not_synced)' },
+    server: { received_at: '2026-09-21T16:00:01.200+08:00' },
+    viewer: { answered_at: null, answered_by: null }
+  }
+};
+const cases = [
+  Object.assign({}, base, { device_state: 'LOCAL_ACKED', server_state: 'RECEIVED',
+    viewer_state: 'PENDING', device_label: '已本地确认（板子自己亮灯了）',
+    server_label: 'VPS 已接收', viewer_label: '还没人回应',
+    answerable: true, stage: '等待查看者回应（VPS 已接收）' }),
+  Object.assign({}, base, { event_id: 'help-a2', device_state: 'LOCAL_ACKED',
+    server_state: 'RECEIVED', viewer_state: 'ANSWERED',
+    device_label: '已本地确认（板子自己亮灯了）', server_label: 'VPS 已接收',
+    viewer_label: '查看者已回应', answerable: false,
+    answered_by: '同学B', answer_text: '<b>灯常亮了</b> & 我处理了',
+    clock_sources: { device: base.clock_sources.device,
+      server: base.clock_sources.server,
+      viewer: { answered_at: '2026-09-21T16:00:30.000+08:00', answered_by: '同学B' } },
+    stage: '已完成：查看者已回应' }),
+  Object.assign({}, base, { event_id: 'help-a3', device_state: 'LOCAL_ACKED',
+    server_state: 'EXPIRED', viewer_state: 'PENDING',
+    device_label: '已本地确认（板子自己亮灯了）', server_label: '已过期（服务端收到了但没人回应）',
+    viewer_label: '还没人回应', answerable: false, stage: '已过期：服务端收到了，但一直没人回应' })
+];
+
+renderHelp({ helps: cases, pending_count: 1, server_now: '2026-09-21T16:00:40+08:00' });
+const outH = els.helpList.innerHTML;
+
+check('三段状态层都渲染出来（3 条 × 3 层）',
+  (outH.match(/class="hcell l[123]"/g) || []).length === 9);
+check('没有 undefined 漏出来', !/undefined/.test(outH));
+check('板子时钟原文保留（含未对时标记）', outH.includes('time_not_synced'));
+check('未回应时第三层显示「还没人回应」', outH.includes('还没人回应'));
+check('回应内容被 HTML 转义（不注入）',
+  outH.includes('&lt;b&gt;灯常亮了&lt;/b&gt; &amp; 我处理了'));
+check('已回应的那条：回应按钮禁用',
+  /data-id="help-a2"[\s\S]*?data-act="answer" disabled/.test(outH));
+check('已回应的那条：取消按钮也禁用',
+  /data-id="help-a2"[\s\S]*?data-act="cancel" disabled/.test(outH));
+check('待回应的那条：按钮可用', /data-id="help-a1"[\s\S]*?data-act="answer">回应/.test(outH));
+check('过期的那条：给出不能回应的理由', outH.includes('已过期，不能再回应'));
+check('待回应计数写进了页面', els.helpPending.textContent === 1);
+check('总数写进了页面', els.helpTotal.textContent === 3);
+
+// ---------- 5. renderAsk（第4周：问答 + 调用链 + 守卫）----------
+console.log('\n== 5. 第4周：问答卡片渲染 ==');
+const startA = src.indexOf('function renderAsk(');
+const endA = src.indexOf('function askQuestion(');
+if (startA < 0 || endA < 0) { check('能抽出 renderAsk', false); }
+// renderAsk 依赖 esc() 与 GUARD_LABEL，它们定义在文件更早的位置，得一并带上
+const escSrc = src.slice(src.indexOf('function esc('), src.indexOf('function shortTime('));
+const guardSrc = src.slice(src.indexOf('var GUARD_LABEL ='), src.indexOf('function askHealth('));
+const blockA = escSrc + '\n' + guardSrc + '\n' + src.slice(startA, endA);
+const renderAsk = new Function('el', blockA + '\n return renderAsk;')(el);
+
+const res = {
+  answer: '还没拍好。\n- 当前状态：PENDING',
+  tool_calls: [
+    { tool: 'request_capture', args: { device_id: 's3eye-group01' }, ok: true,
+      source: 'POST /api/command', time: '2026-09-21T16:08:30.000+08:00', state: 'PENDING' },
+    { tool: 'get_command_status', args: { request_id: 'req-1' }, ok: true,
+      source: 'GET /api/command/status', time: '2026-09-21T16:08:30.100+08:00', state: 'PENDING' }
+  ],
+  guardrails: ['success_without_evidence'],
+  completion_evidence: false,
+  note: '本回答由产品运行时模型（Ollama）生成。'
+};
+const outA = renderAsk('<script>坏东西</script>', res);
+check('问题里的标签被转义（不注入）', !outA.includes('<script>坏东西'));
+check('工具调用链两次都摊开了',
+  (outA.match(/class="c1"/g) || []).length === 2);
+check('调用链里带 source', outA.includes('source=POST /api/command'));
+check('调用链里带 time', outA.includes('time=2026-09-21T16:08:30.000+08:00'));
+check('调用链里带 state', outA.includes('state=PENDING'));
+check('守卫标记翻成人话', outA.includes('已拦下「无证据的假成功」'));
+check('没有 undefined 漏出来', !/undefined/.test(outA));
+
+const outA2 = renderAsk('你好', { answer: '在的', tool_calls: [], guardrails: [],
+  completion_evidence: false, note: 'n' });
+check('没调工具时明说「没有调用任何工具」', outA2.includes('没有调用任何工具'));
+check('无完成证据时如实标注', outA2.includes('本轮没有采集完成证据'));
+
+console.log('\n' + '='.repeat(60));
+console.log('结果：' + (fails.length ? '失败 ' + fails.length + ' 项：' + fails.join('、')
+                                   : '全部通过'));
+console.log('='.repeat(60));
+process.exit(fails.length ? 1 : 0);
