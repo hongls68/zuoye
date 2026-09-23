@@ -291,6 +291,12 @@ def main() -> int:
             proc.kill()
         logf.close()
         shutil.rmtree(TMP, ignore_errors=True)
+        if os.path.isdir(TMP):
+            # ★ 别只写 ignore_errors=True 就算完：Windows 上服务端子进程可能还没
+            #   放开 data.db 的文件句柄，rmtree 会**静默失败** —— 于是"跑完自删"
+            #   变成"跑完留下一堆 tmpdata_* 而没人知道"。
+            #   自测可以删不掉临时目录，但不该把这件事瞒下来。
+            print("（临时目录未能删除，可能仍有进程占着文件：%s）" % TMP)
 
     print("\n" + "=" * 60)
     print("结果：%s" % ("全部通过" if not fails
