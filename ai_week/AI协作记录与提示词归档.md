@@ -356,7 +356,7 @@ AI 的处理方式是：**不看"还剩什么功能没写"，而是看"已经写
 **这里值得记的是"怎么找"这件事。** 无约束的"继续"很容易变成
 "再写点新功能" —— 那样只会让系统更宽，不会让它更一致。
 AI 用的是**交叉核对**：把新加的数据，对照所有已有入口逐项比一遍
-（白名单？工具有吗？提示词写了吗？）。这条方法本身后来被写进了复盘文档 §7.9，
+（白名单？工具有吗？提示词写了吗？）。这条方法本身后来被写进了复盘文档 §13.9，
 成了"加一张表时要同时问三件事"的检查清单。
 
 > **一句话：`继续` 这种无约束指令，应该被理解成"去把不一致的地方找出来"，
@@ -802,11 +802,11 @@ except OSError as e:
 | 第 2 周收尾 | 「做」+ 考核要求 | `20760cd`、`289d679`、`d05e32f` | `server/server.py`、`server/selftest_gallery.py`、`server/index.html`、`README.md` |
 | 第 3 周 | 完整四周课表 + `做完三四周的` | 见下方提交历史 | `firmware/main/help_btn.c`、`help_btn.h`、`app_config.h`、`main.c`、`server/server.py`、`server/selftest_help.py`、`server/index.html`、`第三周-按键触发与物理反馈闭环.md` |
 | 第 4 周 | 同上（一次给全四周，AI 自行排期） | 见下方提交历史 | `server/nl_agent.py`、`server/selftest_nl.py`、`server/selftest_page.js`、`server/server.py`、`server/index.html`、`第四周-用自然语言查询与请求采集.md` |
-| 第 5 周收尾 | `请继续执行任务`（AI 自行交叉核对，补掉一处遗漏） | 见下方提交历史 | `server/nl_agent.py`（+2 只读工具、+第6条铁律、+`yaw_fabricated` 守卫）、`server/selftest_nl.py`（17 → 21 组）、`server/index.html`、`第四周-用自然语言查询与请求采集.md` §十四、`第五周-传感器示波器与姿态孪生.md` §十一 |
+| 第 5 周收尾 | `请继续执行任务`（AI 自行交叉核对，补掉一处遗漏） | `9d5938e` | `server/nl_agent.py`（+2 只读工具、+第6条铁律、+`yaw_fabricated` 守卫）、`server/selftest_nl.py`（17 → 21 组）、`server/index.html`、`第四周-用自然语言查询与请求采集.md` §十四、`第五周-传感器示波器与姿态孪生.md` §十一 |
 | 第 5 周 | 逐屏对账参考实现 + 最小可行范围 + `做，做完就上传github` | 见下方提交历史 | `firmware/main/wave.c`、`wave.h`、`qma7981.c`（I2C 互斥）、`main.c`、`app_config.h`、`server/server.py`、`server/selftest_wave.py`、`server/selftest_page.js`、`server/index.html`、`第五周-传感器示波器与姿态孪生.md` |
-| 第 2 周欠账补做 | `请继续执行任务`（AI 翻计划书原文，补「不是可选项」的断网缓冲） | 见下方提交历史 | `firmware/main/backlog.c`、`backlog.h`（新）、`main.c`、`app_config.h`、`partitions.csv`、`CMakeLists.txt`、`server/server.py`、`server/nl_agent.py`、`server/selftest_backlog.py`（新）、`server/index.html`、`断网补传设计说明.md`（新） |
+| 第 2 周欠账补做 | `请继续执行任务`（AI 翻计划书原文，补「不是可选项」的断网缓冲） | `22e0566` | `firmware/main/backlog.c`、`backlog.h`（新）、`main.c`、`app_config.h`、`partitions.csv`、`CMakeLists.txt`、`server/server.py`、`server/nl_agent.py`、`server/selftest_backlog.py`（新）、`server/index.html`、`断网补传设计说明.md`（新） |
 
-**完整提交历史**（截至第 5 周共 31 笔，`git log --oneline --reverse` 可复核）：
+**完整提交历史**（截至断网补传补做，共 33 笔，`git log --oneline --reverse` 可复核）：
 
 ```
 fc48008 初始版本：ESP32-S3-EYE 加速度计采集 + Wi-Fi 上传（不含摄像头）
@@ -840,6 +840,8 @@ e532373 docs: 复盘补记 git push 卡死的真正根因与可用命令
 f9d8664 feat(test): 同伴走查引导脚本 + 第4周「无响应记录」+ 文档同步
 14d5a33 docs: 参考实现演示视频逐屏对标 + 更正一处"做不了"的范围
 35ff65a feat: 第5周传感器示波器与姿态孪生 —— 20Hz 批量上传 + 时间轴三档 + CSS 3D 孪生
+9d5938e feat(nl): 第5周波形/姿态数据接入自然语言问答 —— 补白名单 + 2 只读工具 + 航向守卫
+22e0566 feat: 断网补传 —— 离线 Flash 缓存与恢复上传（第2周计划书欠账补做）
 ```
 
 ---

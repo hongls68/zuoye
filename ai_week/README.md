@@ -1109,10 +1109,10 @@ curl --noproxy '*' http://127.0.0.1:11434/api/tags
     `IncompleteRead(0 bytes read, N more expected)`，而服务端日志显示 200、毫无异常。
     教训是**响应头里的 `Content-Length` 与实际写出的字节数必须一起看** ——
     这个 bug 靠看日志永远发现不了，只能靠端到端自测。也正因如此，
-    本项目的两个自测脚本都跑**真实 HTTP 往返**，不做函数级 mock。
+    本项目的自测脚本都跑**真实 HTTP 往返**，不做函数级 mock。
 24. **自测脚本显式绕开 HTTP 代理**：本机开着 Clash（`http_proxy` 环境变量），
     连 `127.0.0.1` 的请求都会被劫到代理上，返回 `502 upstream connect failed`。
-    两个自测脚本都改用 `build_opener(ProxyHandler({}))`，否则换台机器跑就全红。
+    所有自测脚本都改用 `build_opener(ProxyHandler({}))`，否则换台机器跑就全红。
 25. **求助事件把状态拆成三列而不是一个 `state`（第 3 周核心）**：
     `device_state`（板子说的）/ `server_state`（服务端说的）/ `viewer_state`（人说的）分别独立存。
     压成一个字段就会重演第 2 周"旧值冒充"那类错误 —— 拿一个来源的事实去冒充另一个来源的事实。
