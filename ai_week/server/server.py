@@ -73,10 +73,31 @@ AI交互课 —— 传感器数据接收与存储服务
       E2 时序合理   观测的 capture_ts 必须晚于指令的 dispatched_at
       E3 新鲜度单调 同一次开机（boot_id）内 seq 必须严格递增
 
+【第5周】传感器示波器：三轴波形 + 姿态孪生（对标参考产品的「传感器示波器」页）：
+  POST /api/waveform              板端**批量**上传一批连续采样（默认 20Hz × 100 点）
+  GET  /api/waveform?device_id=X&batches=N  取最近 N 批，拼成一条连续波形
+  GET  /api/attitude?device_id=X  只取最新姿态（3D 孪生面板高频轮询用，比拉波形轻）
+
+  ★ 为什么是批量上传，不是参考产品那样的 ~20Hz 实时推送：
+    板↔电脑这条 Wi-Fi 链路实测延迟 3ms~770ms 剧烈抖动（第 1 周就确认了），
+    在这条链路上维持长连接（WebSocket / MQTT）是给自己添堵。
+    批量上传对丢包是**天然容错**的：丢一批只少一段波形，不会把连接搞死。
+
+  ★ 姿态只用三轴加速度计就能判，因为加速度计测的是"重力指向设备的哪一面"：
+      能测：平放 / 竖立 / 侧立 / 自由倾斜（凡由倾斜决定的状态）
+      测不到：绕重力轴自转的**航向 Yaw** —— 自转不改变重力方向
+    所以 yaw 这一列**永远为 NULL**，并带一句 yaw_note 说明原因。
+    「测不到」要跟着数据一起出去，否则看的人分不清是"没采到"还是"测不了"。
+
+  ★ 数据保留策略在这里分岔，别搅在一起：
+      原图   = 证据 → 元数据（含 SHA-256）永久留，只清原图（默认 7 天）
+      波形   = 过程 → 留够复现窗口就行（默认每设备最近 720 批 ≈ 1 小时）
+
 运行：python server.py   （默认监听 0.0.0.0:8000）
 """
 import hashlib
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -167,6 +188,73 @@ HELP_LABEL = {
     HELP_VWR_ANSWERED:    "③ 查看者已回应",
     HELP_VWR_IGNORED:     "查看者已忽略",
 }
+
+# ---- 传感器示波器：三轴波形 + 姿态（对标参考产品的「传感器示波器」页）----
+#
+# 【为什么是批量上传，而不是参考产品那样的 ~20Hz 实时推送】
+#   板子↔电脑这条 Wi-Fi 链路实测延迟在 3ms~770ms 之间剧烈抖动（第 1 周就确认了），
+#   在这条链路上维持一条长连接（WebSocket / MQTT）是给自己添堵。
+#   批量上传对丢包是**天然容错**的：丢一批只少一段波形，不会把连接搞死。
+#   所以板端本地按 20Hz 采样、攒够一批再 POST 一次，服务端按批存、网页画"最近 N 批"。
+WAVE_MAX_BATCH = 600            # 单批样本数上限（20Hz × 30 秒）
+# 每设备保留最近多少批（20Hz×100点@5s ≈ 1 小时）。可用环境变量覆盖 ——
+# 自测就是靠把它压到个位数来验证清理逻辑的。
+WAVE_KEEP_BATCHES = int(os.environ.get("WAVE_KEEP_BATCHES") or 720)
+WAVE_PURGE_INTERVAL_S = 60      # 后台波形清理周期（秒）
+WAVE_MAX_ABS_RAW = 32767        # 原始计数按 int16 收，超出就是脏数据
+WAVE_MAX_HZ = 200               # 采样率上限，防呆
+
+# 原始计数 → g 的换算。★ 这里差点埋坑，写清楚：
+#   板端 qma7981.c 是  g = raw / (QMA7981_LSB_PER_G × QMA7981_CALIB_SCALE)
+#                                  = raw / (1024 × 0.8078) ≈ raw / 827.19
+#   两个因子**都要**跟着数据走，不能只发一个：
+#     lsb_per_g  手册标称灵敏度（±8g 量程 = 1024 LSB/g）
+#     calib      实测标定系数（板子水平静置时 |a| 应为 1.000 的那个修正）
+#   只发一个融合后的系数，以后就没法回答"这个偏差是量程选错还是零点没标"。
+WAVE_DEFAULT_LSB_PER_G = 1024.0
+WAVE_DEFAULT_CALIB = 0.8078
+
+# 姿态分类阈值：归一化后的重力投影超过它，才认为"这一面确实朝下/朝上"。
+# 0.85 ≈ 与主轴夹角 31.8° 以内。取这个值的理由：太松会把"斜着拿"误判成平放，
+# 太严则正常摆放（桌面未必绝对水平）都会掉进 Tilted。
+POSTURE_MAJOR_AXIS = 0.85
+
+# ★ 唯一一处「只能假设、无法自证」的约定，单独提出来放在最显眼的地方。
+#
+# 加速度计的读数里有一半是**可以百分之百确定**的：
+#     静止时它测的是"支撑力"而不是"重力本身"（比力 f = a − g，a=0），
+#     所以读数指向**天空** —— 这正是 |a| 恒为 1 g、与摆放姿态无关的原因。
+#     于是 **az > 0 ⟺ 传感器的 +Z 轴朝上**，这一条与芯片怎么贴装无关。
+#
+# 另一半**只能假设**：+Z 轴对应板子的哪一面。这取决于芯片在板上的贴装方向，
+# 乐鑫没有公布，我们手上也没有板子可以实测。所以提成一个常量：
+#     数值照算，只有"哪一面朝上"这句文案跟着它变。
+# 拿到板子后平放一次 —— 看串口 az 是正还是负、当时朝上的是哪一面；
+# 若与下面的约定相反，把这行改成 True 即可，其余代码一行都不用动。
+#
+# 当前取 False（az>0 → 背面朝上）的依据：本板平放时实测 az ≈ +0.7，
+# 而参考产品把自己的平放态标成 "Flat Down（背面朝上）"，两者一致。
+Z_UP_IS_FRONT_FACE = False
+
+# 姿态分类结果（与参考产品的四档对齐：Side Edge / Upright / Tilted / Flat Down）
+POSTURE_LABEL = {
+    "flat":      "平放",
+    "upright":   "竖直正面",
+    "side_edge": "侧边直立",
+    "tilted":    "自由倾斜",
+    "unknown":   "无法判定",
+}
+POSTURE_EN = {
+    "flat":      "Flat",
+    "upright":   "Upright",
+    "side_edge": "Side Edge",
+    "tilted":    "Tilted",
+    "unknown":   "Unknown",
+}
+
+# ★ 本板测不到航向。这句话要跟着数据一起出去，而不是只在文档里写一遍 ——
+#   否则网页上那个"航向"格子空着，看的人分不清是"没采到"还是"测不了"。
+YAW_NOTE = "本板无陀螺仪/磁力计：航向（绕重力轴自转）在原理上不可测，不是没采到"
 
 _db_lock = threading.Lock()
 
@@ -322,6 +410,58 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_help_dev "
             "ON help_events(device_id, received_at DESC)"
         )
+
+        # 传感器示波器：一批 = 板端攒好的一小段连续采样（默认 20Hz × 5 秒 = 100 点）。
+        #
+        # 【为什么按批存，而不是一点一行】
+        #   20Hz 一点一行的话，一小时就是 7.2 万行 —— 库里全是波形，查询和备份都被拖累。
+        #   波形是**过程数据**，成批进来、成批用掉，没有"查第 31872 个点"这种需求。
+        #   所以一批一行，样本序列压成紧凑字符串（"x,y,z;x,y,z;…"）存在 samples 里。
+        #
+        # 【样本存原始计数，不存换算后的 g】
+        #   原始 ADC 计数是一手证据（第 1 周"三处对账"就是拿它对的），
+        #   换算系数（scale）另存一列 —— 以后标定系数改了，历史数据仍可重算。
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS wave_batches(
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id    TEXT NOT NULL,
+                boot_id      TEXT,
+                batch_seq    INTEGER,
+                hz           INTEGER,
+                n_samples    INTEGER NOT NULL,
+                lsb_per_g    REAL,            -- 手册标称灵敏度（±8g 量程 = 1024）
+                calib        REAL,            -- 实测标定系数
+                scale        REAL,            -- 派生：g = raw × scale（= 1/(lsb_per_g×calib)）
+                t_first      TEXT,            -- 板端时钟：批内首样本时刻（只存，不采信）
+                t_last       TEXT,            -- 板端时钟：批内末样本时刻（只存，不采信）
+                dropped      INTEGER,         -- 板端如实上报：攒批期间因环形缓冲溢出丢掉的样本数
+                received_at  TEXT NOT NULL,   -- ★ 服务端时钟：入库时刻，判定一律用它
+                samples      TEXT NOT NULL,   -- 紧凑 "x,y,z;x,y,z;…"（原始 int16 计数）
+                ax_raw       INTEGER,         -- 批内末样本的原始值（便于快速取"当前值"）
+                ay_raw       INTEGER,
+                az_raw       INTEGER,
+                ax           REAL,            -- 换算后的 g 值
+                ay           REAL,
+                az           REAL,
+                acc_mag      REAL,            -- 合加速度 |a|（g），静止时 ≈ 1
+                pitch        REAL,            -- 俯仰（度），由重力向量反算
+                roll         REAL,            -- 横滚（度），由重力向量反算
+                posture      TEXT,            -- 姿态分类 key（见 POSTURE_LABEL）
+                posture_note TEXT,            -- 例如"正面朝上"
+                yaw          REAL,            -- ★ 永远为 NULL：本板测不到航向
+                yaw_note     TEXT             -- 为什么是 NULL，跟着数据一起走
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wave_dev "
+            "ON wave_batches(device_id, id DESC)"
+        )
+        # 老库补列：CREATE TABLE IF NOT EXISTS 对已存在的表不会加列，
+        # 所以新加的字段必须单独 ALTER 一次，否则旧 data.db 一查就报 no such column。
+        wave_cols = {r[1] for r in conn.execute("PRAGMA table_info(wave_batches)")}
+        for col, decl in (("dropped", "INTEGER"),):
+            if col not in wave_cols:
+                conn.execute(f"ALTER TABLE wave_batches ADD COLUMN {col} {decl}")
         conn.commit()
     finally:
         conn.close()
@@ -425,6 +565,19 @@ def add_seconds(iso: str, seconds: int) -> str:
                 + timedelta(seconds=seconds)).isoformat(timespec="milliseconds")
     except (ValueError, TypeError):
         return iso
+
+
+def parse_iso(iso: str):
+    """ISO8601 → datetime。解析不了就返回 None（不猜、不拿"现在"顶替）。
+
+    波形接口用它算"每个样本距离现在多少秒"。
+    返回 None 时调用方会把时间差按 0 处理 —— 时间轴可能不准，
+    但**绝不会因为一个坏时间戳就把整条波形丢掉**。
+    """
+    try:
+        return datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return None
 
 
 def command_timeline(row: sqlite3.Row) -> list:
@@ -543,6 +696,215 @@ def sweep_commands(conn: sqlite3.Connection) -> int:
     if changed:
         conn.commit()
     return changed
+
+
+# ---------------- 传感器示波器：波形入库与姿态判定 ----------------
+#
+# 【姿态判定为什么只用三轴加速度计就够 —— 这是本文件里最值得说清的一件事】
+#
+#   加速度计测的是「重力方向指向设备的哪一面」。
+#   凡是**由倾斜决定**的状态，它都能测：平放、竖立、侧立、斜着放。
+#
+#   它测不到的只有一种：**绕重力轴自转**（航向 Yaw）。
+#   因为自转不改变重力方向 —— 无论怎么转，重力还是指着同一面。
+#   要测它必须用陀螺仪（积分角速度）或磁力计（找地磁北）。
+#
+#   所以参考产品那个「特征：自由倾斜（Tilted） · 1.02G」里，
+#   那个 1.02G 恰恰说明它也是**拿重力模长在判姿态** —— 静止时必然 ≈ 1 g。
+#   换句话说：**姿态分类这块，我们的板子完全做得出来**；
+#   做不出来的只有六轴里的 Gyro 三路波形和 3D 孪生的 Yaw。
+#   （第 2 周的对账表原写「六轴 Gyro 与 3D 姿态都做不了」，范围划宽了，已更正。）
+
+
+def classify_posture(ax: float, ay: float, az: float) -> tuple:
+    """只用重力方向判定姿态。返回 (key, 中文标签, 英文标签, 补充说明)。
+
+    轴定义以板子自身坐标系为准（与 qma7981 读出的 x/y/z 一致）：
+        x → 板面内一个方向      y → 板面内另一个方向      z → 垂直板面向外（摄像头那面）
+    ★ 不同安装方向要改的就是这里：真机实测后按实际摆放调整轴的含义。
+    """
+    if ax is None or ay is None or az is None:
+        return "unknown", POSTURE_LABEL["unknown"], POSTURE_EN["unknown"], "读数缺失"
+    mag = math.sqrt(ax * ax + ay * ay + az * az)
+    if mag < 1e-6:
+        return ("unknown", POSTURE_LABEL["unknown"], POSTURE_EN["unknown"],
+                "合加速度≈0：自由落体或传感器未就绪，方向无从谈起")
+
+    ux, uy, uz = ax / mag, ay / mag, az / mag
+    mx, my, mz = abs(ux), abs(uy), abs(uz)
+
+    if max(mx, my, mz) < POSTURE_MAJOR_AXIS:
+        return ("tilted", POSTURE_LABEL["tilted"], POSTURE_EN["tilted"],
+                "没有哪一轴占绝对主导，设备处于斜放状态")
+    if mz >= mx and mz >= my:
+        # ★ 方向：这里必须把「能确定的」和「只能假设的」分开写，否则很容易写反。
+        #
+        # 【能 100% 确定的部分】
+        #   静止时加速度计测的不是"重力本身"，而是**支撑力**（比力 f = a − g，a=0）
+        #   —— 所以它的读数指向**天空**。这正是 |a| 恒为 1 g、与摆放姿态无关的原因。
+        #   于是：**az > 0 ⟺ 传感器的 +Z 轴朝上（背离地面）**。
+        #   这一条与芯片怎么贴装无关，任何时候都成立。
+        #
+        # 【只能假设的部分】
+        #   "+Z 轴对应板子的哪一面"取决于芯片在板上的贴装方向。
+        #   乐鑫**没有公布这个信息**，我们手上也没有板子可以实测。
+        #   所以它被提成一个显式常量（Z_UP_IS_FRONT_FACE），数值照算，只有文案跟着变。
+        #   拿到板子后平放一次：看串口 az 是正还是负、当时朝上的是哪一面，
+        #   若与本约定相反，改那一行即可，其余代码一行都不用动。
+        #
+        # 【为什么这个错特别难发现】
+        #   写反了的话**所有数字都对、只有文案错**。自测若只断言 posture 这个 key，
+        #   永远抓不到 —— 所以自测里连"说明文字里写没写明哪一面"也一起断言了。
+        if (uz > 0) == Z_UP_IS_FRONT_FACE:
+            side = "正面朝上（摄像头那面向上）"
+        else:
+            side = "背面朝上（摄像头那面朝下）"
+        return "flat", POSTURE_LABEL["flat"], POSTURE_EN["flat"], side
+    if my >= mx:
+        return ("upright", POSTURE_LABEL["upright"], POSTURE_EN["upright"],
+                "竖立，重力落在板面内的长边方向")
+    return ("side_edge", POSTURE_LABEL["side_edge"], POSTURE_EN["side_edge"],
+            "竖立，重力落在板面内的短边方向")
+
+
+def tilt_angles(ax: float, ay: float, az: float) -> tuple:
+    """由重力向量反算 (俯仰 pitch, 横滚 roll)，单位度。
+
+    这两个角是"设备相对于重力"的倾角，所以加速度计就能算。
+    航向 Yaw 不在这里 —— 它相对于重力是无关量，见上面那段说明。
+    """
+    if ax is None or ay is None or az is None:
+        return None, None
+    pitch = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+    roll = math.degrees(math.atan2(ay, az))
+    return round(pitch, 1), round(roll, 1)
+
+
+def parse_samples(raw) -> list:
+    """校验并规整 /api/waveform 的 samples 字段。
+
+    这里刻意"宁可拒收也不猜"：
+      - 样本不是三元组 → 拒（说明板端协议不对，猜一个轴补 0 会把问题藏起来）
+      - 计数超出 int16 → 拒（脏数据，不是"量程大"）
+    返回 (样本列表, 错误说明)；出错时样本列表为 None。
+    """
+    if not isinstance(raw, list):
+        return None, "samples 必须是数组"
+    if not raw:
+        return None, "samples 不能为空"
+    if len(raw) > WAVE_MAX_BATCH:
+        return None, "单批样本数 %d 超过上限 %d" % (len(raw), WAVE_MAX_BATCH)
+    out = []
+    for i, s in enumerate(raw):
+        if not isinstance(s, (list, tuple)) or len(s) != 3:
+            return None, "第 %d 个样本不是 [x,y,z] 三元组" % i
+        trip = []
+        for v in s:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return None, "第 %d 个样本含非数值" % i
+            iv = int(v)
+            if abs(iv) > WAVE_MAX_ABS_RAW:
+                return None, "第 %d 个样本计数 %s 超出 ±%d" % (i, iv, WAVE_MAX_ABS_RAW)
+            trip.append(iv)
+        out.append(trip)
+    return out, None
+
+
+def samples_to_text(samples: list) -> str:
+    """紧凑成 "x,y,z;x,y,z;…" —— 比 JSON 数组省掉方括号和引号，解析也更快。"""
+    return ";".join("%d,%d,%d" % (s[0], s[1], s[2]) for s in samples)
+
+
+def samples_from_text(text: str) -> list:
+    out = []
+    for part in (text or "").split(";"):
+        if not part:
+            continue
+        try:
+            x, y, z = part.split(",")
+            out.append([int(x), int(y), int(z)])
+        except ValueError:
+            continue
+    return out
+
+
+def wave_row_out(row) -> dict:
+    """把一行 wave_batches 变成网页能直接用的结构。
+
+    ★ 时间口径：`received_at` 是**服务端自己的钟**，`t_first`/`t_last` 是板子报的。
+      两个都给出，且明确标注 —— 沿用第 3 周的铁律：
+      **服务端绝不拿板端报的时间当判定依据。**
+    """
+    d = row_to_dict(row)
+    d.pop("samples", None)          # 单条输出不带整批样本，太重
+    # 老库补列后旧行的 dropped 是 NULL。这里归一成 0 再输出 ——
+    # 让前端拿到一个确定的数，而不是显示成 "None" 让人以为是坏数据。
+    d["dropped"] = int(d.get("dropped") or 0)
+    d["posture_label"] = POSTURE_LABEL.get(d.get("posture"), "未知")
+    d["posture_en"] = POSTURE_EN.get(d.get("posture"), "Unknown")
+    d["yaw"] = None                 # 恒为 None：本板测不到，见 YAW_NOTE
+    d["yaw_note"] = YAW_NOTE
+    d["clock_sources"] = {
+        "device": "t_first / t_last（板端时钟，只作参考，服务端不采信）",
+        "server": "received_at（服务端时钟，判定一律用它）",
+    }
+    return d
+
+
+def _wave_batches_contiguous(rows) -> bool:
+    """这几批是不是「同一开机 + 批号逐批 +1 + 采样率一致 + 批间没丢样本」。
+
+    成立时，时间轴可以**完全由 (n_samples, hz) 反推出来**，一个时钟都不用 ——
+    这正是本板 SNTP 对不上时（实测常态）唯一还准的摆法。
+    任一条件不成立就返回 False：宁可退回更差、但不会说谎的那条路，
+    也不要拿一个"看起来很顺"的时间轴去骗人。
+    """
+    if len(rows) < 2:
+        return False
+    hz = rows[-1]["hz"]
+    if not hz or hz < 1:
+        return False
+    if len({r["boot_id"] for r in rows}) != 1:
+        return False                    # 中间重启过：batch_seq 会归零，不能当连续
+    for i, r in enumerate(rows):
+        if r["hz"] != hz:
+            return False
+        if r["dropped"]:
+            return False                # 板端如实报了丢样本 —— 累加就不成立了
+        if r["batch_seq"] is None:
+            return False
+        if i > 0 and r["batch_seq"] != rows[i - 1]["batch_seq"] + 1:
+            return False
+    return True
+
+
+def purge_wave_batches(conn: sqlite3.Connection) -> int:
+    """每设备只保留最近 WAVE_KEEP_BATCHES 批。
+
+    和第 2 周的原图配额是同一个思路，但**结论相反**：
+      原图是"证据" → 元数据永久留，只清原图；
+      波形是"过程" → 留够复现窗口就行，老批直接删。
+    分清"什么是证据、什么是过程"，才不会一刀切地全留或全删。
+    """
+    total = 0
+    devs = [r[0] for r in conn.execute(
+        "SELECT DISTINCT device_id FROM wave_batches").fetchall()]
+    for dev in devs:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM wave_batches WHERE device_id=?", (dev,)
+        ).fetchone()[0]
+        if n <= WAVE_KEEP_BATCHES:
+            continue
+        conn.execute(
+            "DELETE FROM wave_batches WHERE device_id=? AND id NOT IN "
+            "(SELECT id FROM wave_batches WHERE device_id=? "
+            " ORDER BY id DESC LIMIT ?)",
+            (dev, dev, WAVE_KEEP_BATCHES),
+        )
+        total += n - WAVE_KEEP_BATCHES
+    if total:
+        conn.commit()
+    return total
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -689,6 +1051,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_help_poll(q)
         elif path == "/api/ask/health":
             self._handle_ask_health()
+        elif path == "/api/waveform":
+            self._handle_waveform_get(q)
+        elif path == "/api/attitude":
+            self._handle_attitude(q)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1439,6 +1805,282 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_image_file(os.path.join(SNAP_DIR, row["frame_name"]))
 
+    # ---------- 传感器示波器：三轴波形 + 姿态 ----------
+    def _handle_waveform_post(self) -> None:
+        """板端批量上传一批采样。
+
+        板端是**攒够一批再发**的（默认 20Hz × 100 点 = 5 秒一批），
+        不是一点一发 —— 理由见文件顶部 WAVE_MAX_BATCH 那段注释。
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+        device_id = str(data.get("device_id") or "").strip()
+        if not device_id:
+            self._send_json({"error": "device_id 为必填字段"}, 400)
+            return
+
+        samples, err = parse_samples(data.get("samples"))
+        if err:
+            self._send_json({"error": err, "hint": "拒收而不是猜：协议不对就该报错，"
+                                                  "猜一个值补上会把问题藏起来"}, 400)
+            return
+
+        # ★ 注意这几个 `_raw is None` 的写法，别顺手改成 `or 默认值`：
+        #   `data.get("hz") or 20` 会把**合法的 0** 当成"没传"而悄悄替换掉，
+        #   于是 hz=0 这种非法值一路畅通无阻地入库（自测就是抓到了这个）。
+        #   同一个病根在板端也犯过一次（s_led_on 的三态 -1 被当布尔用）。
+        #   **"没有值"和"值是 0"是两件事。**
+        hz_raw = data.get("hz")
+        try:
+            hz = 20 if hz_raw is None or hz_raw == "" else int(hz_raw)
+        except (TypeError, ValueError):
+            hz = 0
+        if hz < 1 or hz > WAVE_MAX_HZ:
+            self._send_json({"error": "hz 必须在 1~%d 之间" % WAVE_MAX_HZ}, 400)
+            return
+
+        def num_or(raw_val, default):
+            """只在"真的没传"时用默认值；传了 0 就老老实实拿 0 去校验。"""
+            if raw_val is None or raw_val == "":
+                return default
+            try:
+                return float(raw_val)
+            except (TypeError, ValueError):
+                return float("nan")
+
+        lsb_per_g = num_or(data.get("lsb_per_g"), WAVE_DEFAULT_LSB_PER_G)
+        calib = num_or(data.get("calib"), WAVE_DEFAULT_CALIB)
+        # 因子不合理就退回默认值，并如实告知 —— 不静默用一个瞎猜的系数，
+        # 否则网页上的 g 值会整体偏移，而没人知道为什么。
+        warn = None
+        if not (1.0 <= lsb_per_g <= 100000.0):
+            warn = "lsb_per_g=%s 不合理，已按默认 %s 处理" % (lsb_per_g,
+                                                             WAVE_DEFAULT_LSB_PER_G)
+            lsb_per_g = WAVE_DEFAULT_LSB_PER_G
+        if not (0.01 <= calib <= 100.0):
+            warn = ((warn + "；") if warn else "") + \
+                   "calib=%s 不合理，已按默认 %s 处理" % (calib, WAVE_DEFAULT_CALIB)
+            calib = WAVE_DEFAULT_CALIB
+        scale = 1.0 / (lsb_per_g * calib)          # g = raw × scale
+
+        # 批内最后一个样本 = "当前值"，用它算姿态（姿态只看当下，不看历史）
+        lx, ly, lz = samples[-1]
+        ax, ay, az = lx * scale, ly * scale, lz * scale
+        acc_mag = math.sqrt(ax * ax + ay * ay + az * az)
+        posture, p_label, p_en, p_note = classify_posture(ax, ay, az)
+        pitch, roll = tilt_angles(ax, ay, az)
+
+        # ★ 服务端时钟：判定一律用它。板子报的 t_first/t_last 原样存着，但不参与判定。
+        received_at = now_iso()
+
+        # 板端如实上报"攒批期间丢了多少样本"。收到就原样存下来 ——
+        # 这个数决定了服务端能不能用 batch_seq 反推时间轴（见 _handle_waveform_get）。
+        try:
+            dropped = int(data.get("dropped") or 0)
+        except (TypeError, ValueError):
+            dropped = 0
+        if dropped < 0:
+            dropped = 0
+
+        with _db_lock:
+            conn = get_db()
+            try:
+                cur = conn.execute(
+                    "INSERT INTO wave_batches(device_id, boot_id, batch_seq, hz, "
+                    "n_samples, lsb_per_g, calib, scale, t_first, t_last, dropped, "
+                    "received_at, samples, "
+                    "ax_raw, ay_raw, az_raw, ax, ay, az, acc_mag, pitch, roll, "
+                    "posture, posture_note, yaw, yaw_note) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (device_id,
+                     str(data.get("boot_id") or ""),
+                     int(data.get("batch_seq") or 0),
+                     hz, len(samples), lsb_per_g, calib, scale,
+                     str(data.get("t_first") or ""),
+                     str(data.get("t_last") or ""),
+                     dropped,
+                     received_at,
+                     samples_to_text(samples),
+                     lx, ly, lz, round(ax, 4), round(ay, 4), round(az, 4),
+                     round(acc_mag, 4), pitch, roll,
+                     posture, p_note,
+                     None,                       # yaw 恒为 NULL：本板测不到
+                     YAW_NOTE),
+                )
+                conn.commit()
+                row_id = cur.lastrowid
+            finally:
+                conn.close()
+
+        self._send_json({
+            "ok": True, "id": row_id, "device_id": device_id,
+            "n_samples": len(samples), "hz": hz, "dropped": dropped,
+            "lsb_per_g": lsb_per_g, "calib": calib, "scale": scale,
+            "received_at": received_at,
+            "posture": posture, "posture_label": p_label, "posture_en": p_en,
+            "posture_note": p_note,
+            "acc_mag": round(acc_mag, 4), "pitch": pitch, "roll": roll,
+            "yaw": None, "yaw_note": YAW_NOTE,
+            "warn": warn,
+        }, 201)
+
+    def _handle_waveform_get(self, q: dict) -> None:
+        """取最近 N 批，拼成一条连续波形给网页画。
+
+        横轴用**相对现在的秒数**（负数往过去）—— 和参考产品那个 `-9s … 现` 一致。
+        这样网页不用管绝对时间，时间轴永远贴着"现在"。
+        """
+        device_id = (q.get("device_id") or [""])[0]
+        if not device_id:
+            self._send_json({"error": "device_id 为必填参数"}, 400)
+            return
+        try:
+            batches = int((q.get("batches") or ["6"])[0])
+        except ValueError:
+            batches = 6
+        batches = max(1, min(batches, 120))
+
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM wave_batches WHERE device_id=? "
+                "ORDER BY id DESC LIMIT ?", (device_id, batches)
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            self._send_json({"ok": True, "device_id": device_id, "batches": 0,
+                             "n_samples": 0, "series": {"t": [], "ax": [], "ay": [], "az": []},
+                             "latest": None,
+                             "hint": "这台设备还没有波形数据。"
+                                     "板端要开着 WAVE_ENABLE 才会按批上传。"}, 200)
+            return
+
+        rows = list(reversed(rows))          # 老的在前，拼出来就是时间正序
+        hz = rows[-1]["hz"] or 20
+        step = 1.0 / hz if hz else 0.05
+
+        # ---- 时间轴锚点怎么选（三条路径，按可信度从高到低）----
+        #
+        # 【为什么这件事值得单独写一段 —— 这是波形特有的需求】
+        #   波形要的是"样本之间隔多久"，是**相对间隔**，不是绝对时刻。
+        #   服务端接收时刻会被网络抖动污染：链路卡一下、3 批几乎同时到，
+        #   按接收时刻摆就全挤在一起，看着像"数据乱了"，其实只是到得晚。
+        #
+        #   路径 ①（最优）板端采样时刻 t_last
+        #     板子的钟可能没对时，但**钟差是个常数**，两条时刻做差之后自动抵消，
+        #     相对间隔反而是准的。
+        #   路径 ②（次优）批号连续 + 采样率已知 → 直接反推
+        #     这块板子的 SNTP 实测经常对不上时，t_last 会写成
+        #     "uptime+12.345s(time_not_synced)" 这种**不可解析**的串，
+        #     所以路径 ① 在这台设备上其实是走不到的 —— 没有路径 ② 就等于
+        #     "只有我造的演示数据好看，真板子反而退化成最差的那条路"。
+        #     批号每批 +1 说明批间没断开，每批时长 = n/hz，从最新一批往回累加即可。
+        #     **前提是批间没丢样本**：板端会如实上报 dropped，不为 0 就不能这么推。
+        #   路径 ③（兜底）服务端接收时刻 received_at
+        #
+        # ★ 注意这三条都不违反"服务端不采信板端时间"那条铁律：
+        #   判定（入库时刻、证据校验、超时归因）一律仍用 received_at；
+        #   这里只是拿它摆**相对间隔**，而且用了哪条路、为什么，都在返回值里写明。
+        dev_times = [parse_iso(r["t_last"]) for r in rows]
+        ends = None                                   # 每批末样本相对"现在"的秒数
+        if all(d is not None for d in dev_times) and len(set(dev_times)) > 1:
+            axis_source = "device"
+            axis_note = ("时间轴用板端采样时刻：钟差是常数，做差后自动抵消，相对间隔准"
+                         "（判定仍用服务端 received_at）")
+            # 老批离"现在"更远 → 更负。符号别写反：是 (该批 − 最新批)。
+            ends = [(d - dev_times[-1]).total_seconds() for d in dev_times]
+        elif _wave_batches_contiguous(rows):
+            axis_source = "derived"
+            axis_note = ("板端没打可解析的时间戳，但批号连续且批间无丢样本，"
+                         "按采样率反推时间轴（比服务端接收时刻准，不受网络抖动影响）")
+            ends = [0.0] * len(rows)
+            acc = 0.0
+            for k in range(len(rows) - 1, 0, -1):
+                acc += rows[k]["n_samples"] * step
+                ends[k - 1] = -acc
+        else:
+            axis_source = "server"
+            # 降级原因要写准 —— "批号不连续"和"只有一批"是两回事，
+            # 笼统写一句会让人去查一个根本不存在的丢批问题。
+            if len(rows) < 2:
+                reason = "只有一批数据，谈不上批间连续"
+            elif any(r["dropped"] for r in rows):
+                reason = "板端如实上报了丢样本（批间有洞），累加不成立"
+            elif len({r["boot_id"] for r in rows}) != 1:
+                reason = "中间重启过（boot_id 变了），批号会归零，不能当连续"
+            else:
+                reason = "批号有断档（中间有批没送达）"
+            axis_note = ("%s，时间轴退回服务端接收时刻 —— 网络抖动会让间隔看起来不匀"
+                         % reason)
+            recv_times = [parse_iso(r["received_at"]) for r in rows]
+            base = recv_times[-1]
+            # 同上：老批 → 更负，所以是 (该批 − 最新批)，不是反过来。
+            ends = [((d - base).total_seconds() if (base and d) else 0.0)
+                    for d in recv_times]
+
+        series_t, sx, sy, sz = [], [], [], []
+        for row, end_at in zip(rows, ends):
+            samples = samples_from_text(row["samples"])
+            scale = row["scale"] or (1.0 / (WAVE_DEFAULT_LSB_PER_G * WAVE_DEFAULT_CALIB))
+            n = len(samples)
+            if n == 0:
+                continue
+            # 批内第 i 个样本：末样本落在 end_at，往前每隔 step 一个
+            t0 = end_at - (n - 1) * step
+            for i, (rx, ry, rz) in enumerate(samples):
+                series_t.append(round(t0 + i * step, 3))
+                sx.append(round(rx * scale, 4))
+                sy.append(round(ry * scale, 4))
+                sz.append(round(rz * scale, 4))
+
+        detail = [{
+            "id": r["id"], "batch_seq": r["batch_seq"], "n": r["n_samples"],
+            "hz": r["hz"], "received_at": r["received_at"],
+            "t_first": r["t_first"], "t_last": r["t_last"],
+            "dropped": int(r["dropped"] or 0),
+            "posture": r["posture"],
+            "posture_label": POSTURE_LABEL.get(r["posture"], "未知"),
+            "acc_mag": r["acc_mag"], "pitch": r["pitch"], "roll": r["roll"],
+        } for r in rows]
+
+        self._send_json({
+            "ok": True, "device_id": device_id,
+            "batches": len(rows), "hz": hz, "n_samples": len(series_t),
+            "window_s": round((len(series_t) - 1) * step, 2),
+            "server_now": now_iso(),
+            "time_axis_source": axis_source,
+            "time_axis_note": axis_note,
+            "series": {"t": series_t, "ax": sx, "ay": sy, "az": sz},
+            "latest": wave_row_out(rows[-1]),
+            "batches_detail": detail,
+        }, 200)
+
+    def _handle_attitude(self, q: dict) -> None:
+        """只要最新姿态 —— 3D 孪生面板高频轮询它，比拉整条波形轻得多。"""
+        device_id = (q.get("device_id") or [""])[0]
+        conn = get_db()
+        try:
+            if device_id:
+                row = conn.execute(
+                    "SELECT * FROM wave_batches WHERE device_id=? "
+                    "ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM wave_batches ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            self._send_json({"ok": True, "attitude": None,
+                             "hint": "还没有波形数据，无法给出姿态"}, 200)
+            return
+        out = wave_row_out(row)
+        out["ok"] = True
+        out["server_now"] = now_iso()
+        self._send_json({"ok": True, "attitude": out, "server_now": out["server_now"]}, 200)
+
     # ---------- POST ----------
     def do_POST(self):
         try:
@@ -1470,6 +2112,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/ask":
             self._handle_ask()
+            return
+        if path == "/api/waveform":
+            self._handle_waveform_post()
             return
         if path != "/api/ingest":
             self._send_json({"error": "not found"}, 404)
@@ -1665,6 +2310,30 @@ def frame_purger() -> None:
             print("[%s] 配额清理异常: %s" % (now_iso(), e), flush=True)
 
 
+def wave_purger() -> None:
+    """后台波形清理线程：每设备只留最近 WAVE_KEEP_BATCHES 批。
+
+    和第 2 周的原图清理刻意分开成两个线程、两个周期：
+      原图是"证据" → 留得久（默认 7 天），元数据永久；
+      波形是"过程" → 留够复现窗口就行（默认 1 小时），老批直接删。
+    合成一个清理器的话，早晚有人把两条策略搅在一起。
+    """
+    while True:
+        time.sleep(WAVE_PURGE_INTERVAL_S)
+        try:
+            with _db_lock:
+                conn = get_db()
+                try:
+                    n = purge_wave_batches(conn)
+                finally:
+                    conn.close()
+            if n:
+                print("[%s] 波形清理：%d 批超出保留窗口（每设备留最近 %d 批）已删"
+                      % (now_iso(), n, WAVE_KEEP_BATCHES), flush=True)
+        except Exception as e:      # 后台线程绝不能因异常退出
+            print("[%s] 波形清理异常: %s" % (now_iso(), e), flush=True)
+
+
 def command_sweeper() -> None:
     """后台把卡住的指令推进到 EXPIRED / TIMEOUT。
 
@@ -1695,6 +2364,7 @@ def main() -> None:
     init_db()
     threading.Thread(target=command_sweeper, daemon=True).start()
     threading.Thread(target=frame_purger, daemon=True).start()
+    threading.Thread(target=wave_purger, daemon=True).start()
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         lan = socket.gethostbyname(socket.gethostname())
@@ -1710,6 +2380,8 @@ def main() -> None:
     print("  按键求助:  POST /api/help(发起/取消) | GET /api/help/poll(板端轮询)"
           " | GET /api/help(网页列表) | POST /api/help/answer"
           " | POST /api/help/cancel", flush=True)
+    print("  传感器示波器: POST /api/waveform(板端批量上传) | GET /api/waveform(取波形)"
+          " | GET /api/attitude(取姿态)", flush=True)
     if nl_agent is None:
         print("  自然语言:  ✗ 不可用（nl_agent.py 导入失败：%s）" % NL_IMPORT_ERR,
               flush=True)

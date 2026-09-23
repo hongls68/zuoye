@@ -170,6 +170,102 @@
   .qa .flags { margin-top: 9px; }
   .qa .flags .badge { margin-right: 6px; }
   .qa .note { font-size: 11px; color: var(--dim); margin-top: 8px; }
+
+  /* ---- 传感器示波器：三轴波形 + 姿态孪生（对标参考产品同名页）---- */
+  .wavebar {
+    display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
+    font-size: 12px; color: var(--dim); margin-bottom: 12px;
+  }
+  .wavebar label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  .wavebar label.off { opacity: .38; cursor: not-allowed; }
+  .wavebar .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .wavebar .sw-x { background: #f87171; }
+  .wavebar .sw-y { background: #34d399; }
+  .wavebar .sw-z { background: #60a5fa; }
+  .wavebar .sw-g { background: #a78bfa; }
+  .scope {
+    background: #0b1220; border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px; position: relative;
+  }
+  .scope canvas { width: 100%; height: auto; display: block; }
+  .scope .scopebar {
+    display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+    font-size: 11px; color: var(--dim); padding: 4px 4px 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .scope .scopebar .dotlive {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
+    display: inline-block; margin-right: 4px;
+  }
+  .scope .scopebar .dotlive.off { background: var(--dim); }
+  .scope .curvals {
+    display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px;
+    font-variant-numeric: tabular-nums; padding: 6px 4px 2px;
+  }
+  .scope .curvals b { font-weight: 600; }
+  .cvx { color: #f87171; } .cvy { color: #34d399; } .cvz { color: #60a5fa; }
+  .cvg { color: #a78bfa; }
+
+  /* 3D 姿态孪生：纯 CSS 3D，不引第三方库 —— 一个盒子加一块地面网格就够说明问题 */
+  .twinwrap { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(200px, 1fr); gap: 14px; margin-top: 14px; }
+  @media (max-width: 720px) { .twinwrap { grid-template-columns: 1fr; } }
+  .twin {
+    perspective: 820px; height: 280px; position: relative; overflow: hidden;
+    background: radial-gradient(circle at 50% 38%, #16233b 0%, #0b1220 72%);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .twin .stage {
+    position: absolute; inset: 0; transform-style: preserve-3d;
+    display: flex; align-items: center; justify-content: center;
+    transform: rotateX(58deg);
+  }
+  .twin .plate {
+    width: 152px; height: 94px; position: relative;
+    transform-style: preserve-3d; transition: transform .18s linear;
+  }
+  .twin .pface {
+    position: absolute; inset: 0; border-radius: 8px;
+    border: 1px solid #34d399; background: rgba(52,211,153,.10);
+    display: flex; align-items: center; justify-content: center; gap: 9px;
+    font-size: 10px; color: #6ee7b7; letter-spacing: .5px; white-space: nowrap;
+  }
+  .twin .pface.back { transform: translateZ(-10px); border-color: #334155; background: rgba(51,65,85,.35); color: var(--dim); }
+  .twin .lens {
+    width: 36px; height: 36px; border-radius: 50%; border: 2px solid #34d399;
+    background: radial-gradient(circle at 35% 32%, #0f172a 0%, #052e2b 70%);
+    box-shadow: 0 0 10px rgba(52,211,153,.45); flex: none;
+  }
+  /* 世界坐标指示器：贴在屏幕角落，不跟着设备转 —— 它是"参照系"，不是设备的一部分 */
+  .twin .gizmo { position: absolute; left: 16px; bottom: 16px; width: 58px; height: 58px; }
+  .twin .gizmo::before {
+    content: ''; position: absolute; left: 0; bottom: 9px; width: 46px; height: 2px;
+    background: linear-gradient(90deg, #f87171, rgba(248,113,113,.15));
+  }
+  .twin .gizmo::after {
+    content: ''; position: absolute; left: 0; bottom: 9px; width: 2px; height: 46px;
+    background: linear-gradient(0deg, #60a5fa, rgba(96,165,250,.15));
+  }
+  .twin .gizmo .gx { position: absolute; right: -2px; bottom: 12px; font-size: 10px; color: #f87171; }
+  .twin .gizmo .gz { position: absolute; left: -5px; top: -5px; font-size: 10px; color: #60a5fa; }
+  .twin .grid {
+    position: absolute; left: 50%; top: 50%; width: 320px; height: 320px;
+    margin: -160px 0 0 -160px;
+    background-image:
+      linear-gradient(rgba(148,163,184,.16) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148,163,184,.16) 1px, transparent 1px);
+    background-size: 32px 32px;
+    transform: rotateX(90deg) translateZ(-46px);
+  }
+  .twininfo { display: flex; flex-direction: column; gap: 8px; justify-content: center; }
+  .twininfo .row { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+  .twininfo .row .k { color: var(--dim); width: 62px; flex: none; font-size: 12px; }
+  .twininfo .row .v { font-variant-numeric: tabular-nums; font-size: 19px; font-weight: 600; }
+  .twininfo .feat {
+    margin-top: 4px; padding: 10px 12px; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--line); font-size: 13px;
+  }
+  .twininfo .feat .big { font-size: 16px; font-weight: 600; color: var(--ok); }
+  .twininfo .cant { color: var(--warn); font-size: 11px; line-height: 1.6; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -270,6 +366,68 @@
   </section>
 
   <section class="cam">
+    <div class="label">
+      传感器示波器 · 三轴波形与姿态孪生 —— 波形是板端**攒批**上传的，姿态只用加速度计（对标参考产品的同名页）
+    </div>
+    <div class="wavebar">
+      <span class="badge" id="waveState">等待波形…</span>
+      <span id="waveMeta">--</span>
+      <label><input type="checkbox" id="chkX" checked><span class="swatch sw-x"></span>Acc X</label>
+      <label><input type="checkbox" id="chkY" checked><span class="swatch sw-y"></span>Acc Y</label>
+      <label><input type="checkbox" id="chkZ" checked><span class="swatch sw-z"></span>Acc Z</label>
+      <label class="off" title="本板载的是 QMA7981 三轴加速度计，没有陀螺仪 —— 这一路物理上不存在">
+        <input type="checkbox" disabled><span class="swatch sw-g"></span>Gyro X/Y/Z（本板无陀螺仪）
+      </label>
+      <button id="waveRefresh">刷新波形</button>
+    </div>
+
+    <div class="scope">
+      <div class="scopebar">
+        <span><span class="dotlive" id="waveLive"></span><span id="waveLiveTxt">等待数据</span></span>
+        <span id="waveBuf">缓冲: --</span>
+        <span id="waveAxis">横轴: 相对现在</span>
+      </div>
+      <canvas id="waveCanvas" width="1080" height="260"></canvas>
+      <div class="curvals" id="waveVals">当前值：--</div>
+    </div>
+
+    <div class="twinwrap">
+      <div class="twin">
+        <div class="stage">
+          <div class="grid"></div>
+          <div class="plate" id="twinPlate">
+            <div class="pface front"><span class="lens"></span>摄像头面</div>
+            <div class="pface back">背面</div>
+          </div>
+        </div>
+        <div class="gizmo"><span class="gx">+X</span><span class="gz">+Z</span></div>
+      </div>
+      <div class="twininfo">
+        <div class="row"><span class="k">俯仰 Pitch</span><span class="v" id="tPitch">--</span></div>
+        <div class="row"><span class="k">横滚 Roll</span><span class="v" id="tRoll">--</span></div>
+        <div class="row"><span class="k">航向 Yaw</span><span class="v" id="tYaw">--</span></div>
+        <div class="feat">
+          特征：<span class="big" id="tPosture">--</span>
+          <span id="tPostureEn" style="color:var(--dim)"></span>
+          · <span id="tMag">--</span>G
+          <div style="color:var(--dim);font-size:12px;margin-top:4px" id="tNote">--</div>
+          <div class="cant" id="tYawNote">--</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="camnote">
+      波形走的是**批量上传**：板端本地按 20Hz 采样、攒够 100 点（5 秒）才 POST 一次，
+      服务端按批存、页面画"最近 N 批"。<b>为什么不学参考产品做 20Hz 实时推送</b> ——
+      板↔电脑这条 Wi-Fi 链路实测延迟在 3ms~770ms 之间剧烈抖动，长连接在这条链路上是负担；
+      批量上传对丢包是天然容错的：丢一批只少一段波形，不会把连接搞死。<br>
+      ★ 孪生体只随 <b>Pitch / Roll</b> 动，<b>Yaw 恒为空白</b>：
+      加速度计测的是"重力指向设备的哪一面"，而绕重力轴自转不改变重力方向，它原理上测不到。
+      这一格空着不是"没采到"，是"测不了" —— 所以旁边必须写明原因，否则看的人分不清这两种情况。
+    </div>
+  </section>
+
+  <section class="cam">
     <div class="label">照片画廊 · 每一帧都在这里（原图按配额清理，元数据与哈希永久保留）</div>
     <div class="galbar">
       <span>共 <b id="galTotal">0</b> 帧</span>
@@ -299,7 +457,14 @@
   照片画廊的数据来自 /api/frames：每帧都记下 SHA-256、分辨率、字节数与来源；原图超过保留期会被后台清理（默认 7 天，可用环境变量 RETENTION_DAYS 调整），但**元数据与哈希永久保留**，所以已清理的帧在列表里依然可查、可校验。<br>
   教学求助区来自 /api/help，方向和第2周相反：**板子主动发起，人来回应**。三条状态格子里的时刻来自三个不同的钟 ——
   板子的钟、服务端的钟、人的动作时刻。服务端只把板子报的时间当"板子的一面之词"存着，判定一律用自己打的时间戳。
-  已回应的求助不能再取消；超时只把服务端状态标成 EXPIRED，板子侧与查看者侧原样不动。</div>
+  已回应的求助不能再取消；超时只把服务端状态标成 EXPIRED，板子侧与查看者侧原样不动。<br>
+  传感器示波器的数据来自 /api/waveform 与 /api/attitude：板端本地按 20Hz 采样、<b>攒够一批（默认 100 点）才 POST 一次</b>，
+  服务端按批入库，页面画"最近 N 批"。样本存的是<b>原始 ADC 计数</b>（一手证据），
+  换算成 g 的两个因子（手册标称 1024 LSB/g × 实测标定 0.8078）也一并存下 ——
+  以后重新标定，历史数据还能重算。姿态四档（平放 / 竖直正面 / 侧边直立 / 自由倾斜）由重力方向判定，
+  <b>只靠三轴加速度计就够</b>；航向 Yaw 恒为空并注明原因（绕重力轴自转不改变重力方向，本板无陀螺仪测不到）。<br>
+  波形是「过程数据」，按保留窗口清理（默认每设备最近 720 批 ≈ 1 小时），
+  这和照片画廊那套「元数据永久、只清原图」的<b>证据</b>策略刻意不同 —— 什么该永久留、什么可以过期，得分开定。</div>
 
 <script>
 (function () {
@@ -407,6 +572,8 @@
     tick();
     refreshRequests();   // 换设备时，指令列表与当前追踪的请求一起跟着切
     refreshGallery();    // 画廊也跟着切设备
+    fetchWave();         // 示波器与姿态孪生同理
+    fetchAttitude();
   });
 
   // ================= 第2周：远程采集指令 =================
@@ -879,6 +1046,252 @@
     b.addEventListener('click', function () { askQuestion(b.getAttribute('data-q')); });
   });
   askHealth();
+
+  // ================= 传感器示波器：三轴波形 + 姿态孪生 =================
+  // 两条独立通道：波形（重，按批）和姿态（轻，高频）。分开取是因为
+  // 3D 孪生要跟手，而几百个采样点没必要跟着一起重拉。
+  var WAVE_MS = 2000;        // 波形刷新周期
+  var ATTI_MS = 800;         // 姿态刷新周期
+  var WAVE_BATCHES = 6;      // 一次取最近几批（6 批 ≈ 30 秒）
+  var waveCh = { x: true, y: true, z: true };
+  var lastWave = null;
+  var lastAt = 0;            // 上次姿态数据到达时刻（判断"还在推"还是"停了"）
+
+  function waveDev() { return el('deviceSelect').value; }
+
+  function fetchWave() {
+    var d = waveDev();
+    if (!d) {
+      el('waveState').className = 'badge';
+      el('waveState').textContent = '还没有设备上报';
+      return;
+    }
+    fetch('/api/waveform?device_id=' + encodeURIComponent(d) +
+          '&batches=' + WAVE_BATCHES)
+      .then(function (r) { return r.json(); })
+      .then(function (d2) {
+        if (!d2 || d2.ok !== true) { throw new Error(d2 && d2.error || '未知错误'); }
+        lastWave = d2;
+        renderWave(d2);
+      })
+      .catch(function (e) {
+        el('waveState').className = 'badge err';
+        el('waveState').textContent = '波形接口不可用：' + e.message;
+      });
+  }
+
+  function renderWave(d) {
+    var st = el('waveState');
+    if (!d.batches) {
+      st.className = 'badge warn';
+      st.textContent = '这台设备还没有波形';
+      el('waveMeta').textContent = '板端要开着 WAVE_ENABLE 才会按批上传';
+      el('waveBuf').textContent = '缓冲: 0 点';
+      drawWave(null);
+      return;
+    }
+    var age = (Date.now() - Date.parse(d.latest.received_at)) / 1000;
+    var live = age < 12;      // 12 秒内还有新批 => 认为"还在推"
+    st.className = 'badge ' + (live ? 'ok' : 'warn');
+    st.textContent = live ? '实时推送中' : ('已停 ' + Math.round(age) + ' 秒');
+    el('waveMeta').textContent =
+      d.batches + ' 批 · ' + d.n_samples + ' 点 · ' + d.hz + 'Hz · 窗口 ' +
+      d.window_s + 's';
+    el('waveBuf').textContent = '缓冲: ' + d.n_samples + ' 点 (' + d.window_s + 's)';
+    // 时间轴是怎么摆出来的 —— 这件事必须写在脸上，因为三种口径含义不同：
+    //   板端采样时刻 = 真正的"样本隔多久"；
+    //   采样率反推   = 批间没丢样本时等价，且不受网络抖动影响；
+    //   服务端接收时刻 = 含网络抖动，最差。
+    var axisTxt = { device: '板端采样时刻（相对现在）',
+                    derived: '采样率反推（批号连续，相对现在）',
+                    server: '服务端接收时刻（相对现在）' };
+    el('waveAxis').textContent = '横轴: ' + (axisTxt[d.time_axis_source]
+      || ('未知来源 ' + d.time_axis_source));
+    el('waveAxis').title = d.time_axis_note || '';
+    var lv = el('waveLive');
+    lv.className = 'dotlive' + (live ? '' : ' off');
+    el('waveLiveTxt').textContent = live ? '实时推送 ~' + d.hz + 'Hz' : '已停止推送';
+    el('waveVals').innerHTML =
+      '<span class="cvx">AX: <b>' + fmt(d.latest.ax) + '</b></span>' +
+      '<span class="cvy">AY: <b>' + fmt(d.latest.ay) + '</b></span>' +
+      '<span class="cvz">AZ: <b>' + fmt(d.latest.az) + '</b></span>' +
+      '<span style="color:var(--dim)">raw: ' + rawTriple(d.latest) + '</span>' +
+      '<span style="color:var(--dim)">|a|: <b>' +
+      (d.latest.acc_mag === null ? '--' : Number(d.latest.acc_mag).toFixed(3)) +
+      '</b> g</span>';
+    drawWave(d);
+  }
+
+  function drawWave(d) {
+    var cv = el('waveCanvas'), ctx = cv.getContext('2d');
+    var W = cv.width, H = cv.height;
+    var padL = 46, padR = 14, padT = 12, padB = 24;
+    var pw = W - padL - padR, ph = H - padT - padB;
+    ctx.fillStyle = '#0b1220';
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = '11px "Segoe UI", sans-serif';
+
+    if (!d || !d.series || !d.series.t.length) {
+      ctx.fillStyle = '#64748b';
+      ctx.fillText('暂无样本 —— 板端攒够一批（默认 100 点）才会 POST 上来', padL, padT + 22);
+      return;
+    }
+    var s = d.series, t = s.t, n = t.length;
+
+    // 纵轴范围：只看勾选的通道。下限兜到 ±1.2g —— 否则静止时三轴都是直线，
+    // 自动缩放会把噪声放大成"剧烈波动"，看着像在动其实没动。
+    var lo = -1.2, hi = 1.2;
+    function scan(arr, on) {
+      if (!on) { return; }
+      for (var i = 0; i < n; i++) {
+        if (arr[i] < lo) { lo = arr[i]; }
+        if (arr[i] > hi) { hi = arr[i]; }
+      }
+    }
+    scan(s.ax, waveCh.x); scan(s.ay, waveCh.y); scan(s.az, waveCh.z);
+    var m = Math.max((hi - lo) * 0.08, 0.05);
+    lo -= m; hi += m;
+
+    var t0 = t[0], t1 = t[n - 1];
+    if (t1 - t0 < 0.001) { t1 = t0 + 1; }
+    function X(v) { return padL + (v - t0) / (t1 - t0) * pw; }
+    function Y(v) { return padT + (hi - v) / (hi - lo) * ph; }
+
+    // 横向网格（g）+ 左侧刻度
+    var stepG = (hi - lo) > 4 ? 1 : 0.5;
+    ctx.strokeStyle = 'rgba(148,163,184,.13)';
+    ctx.fillStyle = '#64748b';
+    ctx.lineWidth = 1;
+    for (var g = Math.ceil(lo / stepG) * stepG; g <= hi + 1e-9; g += stepG) {
+      var yy = Y(g);
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + pw, yy); ctx.stroke();
+      ctx.fillText(g.toFixed(1), 8, yy + 4);
+    }
+    // 0 线单独描一下，静止时的读数贴着它
+    ctx.strokeStyle = 'rgba(148,163,184,.32)';
+    ctx.beginPath(); ctx.moveTo(padL, Y(0)); ctx.lineTo(padL + pw, Y(0)); ctx.stroke();
+
+    // 纵向网格（秒）+ 底部刻度。★ 横轴是**相对现在**：负数往过去，最右边是"现"
+    var secs = t1 - t0;
+    var stepS = secs > 36 ? 10 : (secs > 16 ? 5 : (secs > 7 ? 2 : 1));
+    ctx.strokeStyle = 'rgba(148,163,184,.09)';
+    ctx.fillStyle = '#64748b';
+    for (var sv = Math.ceil(t0 / stepS) * stepS; sv <= t1 + 1e-9; sv += stepS) {
+      var xx = X(sv);
+      ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, padT + ph); ctx.stroke();
+      ctx.fillText(Math.round(sv) + 's', xx - 8, H - 7);
+    }
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('现', padL + pw - 11, H - 7);
+
+    // 三条曲线
+    var lines = [
+      ['ax', '#f87171', waveCh.x],
+      ['ay', '#34d399', waveCh.y],
+      ['az', '#60a5fa', waveCh.z]
+    ];
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = 'round';
+    for (var k = 0; k < lines.length; k++) {
+      var key = lines[k][0], col = lines[k][1], on = lines[k][2];
+      if (!on) { continue; }
+      var arr = s[key];
+      ctx.strokeStyle = col;
+      ctx.beginPath();
+      for (var i2 = 0; i2 < n; i2++) {
+        var px = X(t[i2]), py = Y(arr[i2]);
+        if (i2 === 0) { ctx.moveTo(px, py); } else { ctx.lineTo(px, py); }
+      }
+      ctx.stroke();
+    }
+    // 外框
+    ctx.strokeStyle = 'rgba(148,163,184,.28)';
+    ctx.strokeRect(padL + .5, padT + .5, pw - 1, ph - 1);
+  }
+
+  // ---- 3D 姿态孪生 ----
+  // ★ 朝向**完全由重力方向推出**，因为那是加速度计唯一能测的东西。
+  //
+  //   舞台（.stage）那层 rotateX(58deg) 是"摄像机"：它把舞台平面摆成桌面，
+  //   所以桌面坐标系里"重力向下"就是舞台的局部 −Z。
+  //   于是要解的就是一个方程：**R · g设备 = (0,0,−1)**，
+  //   即"把设备坐标系里的重力方向，转到桌面坐标系的竖直向下"。
+  //
+  //   用 rotateZ(φ) + rotateX(θ) 两个自由度刚好能解（重力是 2 自由度）：
+  //     R1 = √(gx²+gy²)
+  //     φ = atan2(gx, gy)            ← 绕桌面竖轴转，把面内重力分量对到 Y 轴
+  //     θ = atan2(R1, gz) + 180°     ← 再绕 X 轴压下去
+  //
+  //   ★ 为什么"刚好两个自由度"这件事很重要：
+  //     绕重力轴自转不改变重力方向 —— 那一个自由度**本来就不可观测**，
+  //     所以 φ 在设备平放时必然算出 0（gx=gy=0），孪生体也就不转。
+  //     这不是"我们没做"，是**物理上测不到**，和 Yaw 那一格空着是同一件事。
+  //
+  //   反面教材：第一版我图省事写成 pitchCss = −asin(uy)、rollCss = asin(ux)，
+  //   数字看着"对"（平放 0°、竖立 ±90°），但**画面是错的** ——
+  //   因为那两个角是相对世界算的，却塞进了一个已经被 rotateX(58°) 转过的父层里。
+  //   单测全过、截图一看就不对。教训：**几何映射必须看渲染结果，不能只断言数值。**
+  function renderTwin(a) {
+    if (!a) {
+      el('tPosture').textContent = '--';
+      return;
+    }
+    var gx = a.ax || 0, gy = a.ay || 0, gz = a.az || 0;
+    var mag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+    var plate = el('twinPlate');
+    if (mag < 1e-6) {
+      // 合加速度≈0：方向无从谈起。不硬摆一个姿态出来，原样停在上一帧并说明。
+      plate.style.transform = 'rotateX(0deg) rotateZ(0deg)';
+    } else {
+      gx /= mag; gy /= mag; gz /= mag;
+      var r1 = Math.sqrt(gx * gx + gy * gy);
+      var phi = Math.atan2(gx, gy) * 180 / Math.PI;
+      var theta = Math.atan2(r1, gz) * 180 / Math.PI + 180;
+      // 归一到 (−180, 180]，免得出现 360° 这种"对但难看"的角度
+      while (theta > 180) { theta -= 360; }
+      while (theta < -180) { theta += 360; }
+      plate.style.transform = 'rotateX(' + theta.toFixed(1) + 'deg) rotateZ(' +
+        phi.toFixed(1) + 'deg)';
+    }
+
+    el('tPitch').textContent = (a.pitch === null ? '--' : a.pitch.toFixed(1) + '°');
+    el('tRoll').textContent = (a.roll === null ? '--' : a.roll.toFixed(1) + '°');
+    // 航向那一格刻意留空 + 说明，不用 0° 顶替 —— 0° 会被当成"测出来是 0"
+    el('tYaw').textContent = '不可测';
+    el('tYaw').style.color = 'var(--warn)';
+    el('tYaw').style.fontSize = '14px';
+    el('tYawNote').textContent = '★ ' + (a.yaw_note || '本板测不到航向');
+
+    el('tPosture').textContent = a.posture_label || '--';
+    el('tPostureEn').textContent = a.posture_en ? '（' + a.posture_en + '）' : '';
+    el('tMag').textContent = (a.acc_mag === null ? '--' : a.acc_mag.toFixed(3));
+    el('tNote').textContent = a.posture_note || '';
+    lastAt = Date.now();
+  }
+
+  function fetchAttitude() {
+    var d = waveDev();
+    if (!d) { return; }
+    fetch('/api/attitude?device_id=' + encodeURIComponent(d))
+      .then(function (r) { return r.json(); })
+      .then(function (d2) { renderTwin(d2 && d2.attitude); })
+      .catch(function () { /* 姿态取不到就先不更新，波形那边会报错 */ });
+  }
+
+  ['chkX', 'chkY', 'chkZ'].forEach(function (id) {
+    el(id).addEventListener('change', function () {
+      waveCh[id.charAt(3).toLowerCase()] = el(id).checked;
+      drawWave(lastWave);
+    });
+  });
+  el('waveRefresh').addEventListener('click', function () {
+    fetchWave();
+    fetchAttitude();
+  });
+  setInterval(fetchWave, WAVE_MS);
+  setInterval(fetchAttitude, ATTI_MS);
+  fetchWave();
+  fetchAttitude();
 
   tick();
   setInterval(tick, POLL_MS);

@@ -61,7 +61,8 @@ const blockH = src.slice(startH, endH);
 
 const els = {};
 function el(id) {
-  return els[id] || (els[id] = { textContent: '', innerHTML: '', value: '', addEventListener() {} });
+  return els[id] || (els[id] = { textContent: '', innerHTML: '', value: '',
+    style: {}, addEventListener() {} });
 }
 const renderHelp = new Function('el', blockH + '\n return renderHelp;')(el);
 
@@ -150,6 +151,151 @@ const outA2 = renderAsk('你好', { answer: '在的', tool_calls: [], guardrails
   completion_evidence: false, note: 'n' });
 check('没调工具时明说「没有调用任何工具」', outA2.includes('没有调用任何工具'));
 check('无完成证据时如实标注', outA2.includes('本轮没有采集完成证据'));
+
+// ---------- 6. 第5周：三轴波形与姿态孪生 ----------
+console.log('\n== 6. 第5周：示波器与姿态孪生 ==');
+
+// --- 6a. renderTwin：朝向完全由重力方向推出 ---
+const startT = src.indexOf('function renderTwin(');
+const endT = src.indexOf('function fetchAttitude(');
+if (startT < 0 || endT < 0) { check('能抽出 renderTwin', false); }
+const renderTwin = new Function('el',
+  src.slice(startT, endT) + '\n return renderTwin;')(el);
+
+function attitudeOf(gx, gy, gz, extra) {
+  const mag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+  return Object.assign({
+    ax: gx, ay: gy, az: gz, acc_mag: mag, pitch: 0, roll: 0,
+    posture: 'tilted', posture_label: '自由倾斜', posture_en: 'Tilted',
+    posture_note: '', yaw: null,
+    yaw_note: '本板无陀螺仪/磁力计：航向（绕重力轴自转）在原理上不可测，不是没采到'
+  }, extra || {});
+}
+
+// 孪生体的朝向 = 解 R·g设备 = (0,0,−1)（桌面坐标系的竖直向下）。
+// 断言的是**几何结果**，不是某个中间变量：
+//   平放 → 不旋转（贴在桌面上）
+//   竖立 → 绕 X 轴 −90°（立起来）
+//   侧立 → 绕 X 轴 −90° 再绕 Z 轴 +90°（立起来并转 90°）
+renderTwin(attitudeOf(0, 0, -1));
+check('平放·正面朝上（重力沿 −Z）→ 孪生体不旋转，贴在桌面上',
+  els.twinPlate.style.transform === 'rotateX(0.0deg) rotateZ(0.0deg)',
+  els.twinPlate.style.transform);
+renderTwin(attitudeOf(0, 1, 0));
+check('竖直正面（重力沿 +Y）→ 立起来（rotateX −90°）',
+  els.twinPlate.style.transform === 'rotateX(-90.0deg) rotateZ(0.0deg)',
+  els.twinPlate.style.transform);
+renderTwin(attitudeOf(1, 0, 0));
+check('侧边直立（重力沿 +X）→ 立起来并转 90°',
+  els.twinPlate.style.transform === 'rotateX(-90.0deg) rotateZ(90.0deg)',
+  els.twinPlate.style.transform);
+renderTwin(attitudeOf(0.577, 0.577, 0.577));
+check('自由倾斜 → 两个轴都有分量（不是 0 也不是 90）',
+  /rotateX\(-125\.3deg\) rotateZ\(45\.0deg\)/.test(els.twinPlate.style.transform),
+  els.twinPlate.style.transform);
+// ★ 平放时 φ 必然算出 0 —— 因为绕桌面竖轴自转不改变重力方向，本来就不可观测。
+//   这一条把"Yaw 测不到"从口号变成了可验证的几何结论。
+//   注意：必须**重新渲染一帧平放**再断言。上面那条 Tilted 用例已经把 transform 改成
+//   rotateZ(45deg) 了，直接读会读到上一帧 —— 断言顺序错会误报成代码错。
+renderTwin(attitudeOf(0, 0, -1));
+check('平放时绕竖轴的角恒为 0（绕重力轴自转不可观测，不是我们没做）',
+  /rotateZ\(0\.0deg\)$/.test(els.twinPlate.style.transform),
+  els.twinPlate.style.transform);
+renderTwin(attitudeOf(0, 0, 0));
+check('合加速度≈0 时不硬摆姿态（归零并说明）',
+  els.twinPlate.style.transform === 'rotateX(0deg) rotateZ(0deg)',
+  els.twinPlate.style.transform);
+
+// ★ 航向那一格是本周最容易做错的地方：留空会被当成"没采到"，填 0° 会被当成"测出来是 0"
+check('航向显示为「不可测」，没有用 0° 顶替',
+  els.tYaw.textContent === '不可测', els.tYaw.textContent);
+check('航向旁边把原因写出来（区分「测不了」和「没采到」）',
+  els.tYawNote.textContent.includes('不可测'), els.tYawNote.textContent);
+
+renderTwin(attitudeOf(0, 0, -1, { posture_label: '平放', posture_en: 'Flat',
+  posture_note: '正面朝上（摄像头那面向上）' }));
+check('特征行同时给出中文与英文姿态名',
+  els.tPosture.textContent === '平放' && els.tPostureEn.textContent.includes('Flat'),
+  els.tPosture.textContent + ' / ' + els.tPostureEn.textContent);
+check('特征行带上合加速度（静止时应 ≈1）',
+  els.tMag.textContent === '1.000', els.tMag.textContent);
+check('姿态补充说明也渲染出来', els.tNote.textContent.includes('正面朝上'));
+
+renderTwin(null);
+check('没有姿态数据时不报错、也不编一个姿态出来',
+  els.tPosture.textContent === '--', els.tPosture.textContent);
+
+// --- 6b. drawWave：喂假 canvas，看它画没画、通道开关生不生效 ---
+const startW = src.indexOf('function drawWave(');
+if (startW < 0 || startT < 0) { check('能抽出 drawWave', false); }
+// drawWave 依赖闭包里的 waveCh，所以连它一起包进一个小作用域再取出来
+const wrap = '(function(){ var waveCh = { x: true, y: true, z: true };\n'
+  + src.slice(startW, startT)
+  + '\n return { drawWave: drawWave, waveCh: waveCh }; })()';
+const W = new Function('el', 'return ' + wrap)(el);
+
+function makeCanvas() {
+  const c = { fillText: 0, lineTo: 0, moveTo: 0, stroke: 0, fillRect: 0 };
+  const ctx = {
+    fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', lineJoin: '',
+    fillRect() { c.fillRect++; },
+    clearRect() {},
+    beginPath() {},
+    moveTo() { c.moveTo++; },
+    lineTo() { c.lineTo++; },
+    stroke() { c.stroke++; },
+    fillText() { c.fillText++; },
+    strokeRect() {}
+  };
+  return { canvas: { width: 1080, height: 260, getContext: () => ctx }, calls: c };
+}
+
+const c0 = makeCanvas();
+els.waveCanvas = c0.canvas;
+let threw = null;
+try { W.drawWave(null); } catch (e) { threw = e.message; }
+check('没有波形数据时只画一句提示，不抛异常',
+  threw === null && c0.calls.fillText === 1,
+  threw || ('fillText=' + c0.calls.fillText));
+
+const series = { t: [], ax: [], ay: [], az: [] };
+for (let i = 0; i < 100; i++) {
+  series.t.push(-5 + i * 0.05);
+  series.ax.push(0.3 * Math.sin(i / 5));
+  series.ay.push(0.1 * Math.cos(i / 7));
+  series.az.push(1.0);
+}
+const c1 = makeCanvas();
+els.waveCanvas = c1.canvas;
+threw = null;
+try { W.drawWave({ series: series }); } catch (e) { threw = e.message; }
+check('有数据时能正常画出整条波形', threw === null, threw);
+check('三条曲线都画了（lineTo ≥ 3×(100-1)）',
+  c1.calls.lineTo >= 297, c1.calls.lineTo);
+
+// 关掉一条通道，画的点数应当明显变少 —— 证明勾选框真的接上了绘制逻辑
+W.waveCh.x = false;
+const c2 = makeCanvas();
+els.waveCanvas = c2.canvas;
+W.drawWave({ series: series });
+check('取消勾选 Acc X 后少画一条曲线',
+  c2.calls.lineTo < c1.calls.lineTo && c2.calls.lineTo >= 198,
+  c1.calls.lineTo + ' → ' + c2.calls.lineTo);
+
+// 静止数据不该被自动缩放放大成"看着在动"
+const flat = { t: [], ax: [], ay: [], az: [] };
+for (let i = 0; i < 50; i++) {
+  flat.t.push(-2.5 + i * 0.05);
+  flat.ax.push(0.001 * (i % 2));    // 只有极小的噪声
+  flat.ay.push(0);
+  flat.az.push(1.0);
+}
+const c3 = makeCanvas();
+els.waveCanvas = c3.canvas;
+W.waveCh.x = true;
+W.drawWave({ series: flat });
+check('纵轴有 ±1.2g 下限，静止数据不会被噪声放大',
+  c3.calls.fillText > 0 && c3.calls.lineTo > 0, c3.calls.lineTo);
 
 console.log('\n' + '='.repeat(60));
 console.log('结果：' + (fails.length ? '失败 ' + fails.length + ' 项：' + fails.join('、')

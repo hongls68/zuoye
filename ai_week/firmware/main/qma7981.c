@@ -12,6 +12,7 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "app_config.h"
@@ -25,6 +26,24 @@ static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
 static bool s_inited = false;
 
+/*
+ * ★ I2C 总线互斥锁 —— 第5周加。
+ *
+ * 在此之前 qma7981_read() 只有主循环一个调用者，天然不会并发。
+ * 第5周多了个 20Hz 的采样任务（wave.c），于是同一个 I2C 设备被两个任务读：
+ * 一次 `i2c_master_transmit_receive` 是"写寄存器地址 + 读 6 字节"两段时序，
+ * 中间被另一个任务插进来，读到的一定是错的数据 —— 而且**不会报错**，
+ * 只是数值莫名其妙地跳一下。这类问题在波形上表现为"偶尔冒一个尖刺"，
+ * 极易被当成"传感器噪声"放过去。
+ *
+ * 用普通互斥量就够：下面几个函数之间没有嵌套调用（qma7981_read 不经过
+ * qma7981_read_reg），不存在自己等自己。
+ *
+ * 注意：摄像头的 SCCB 也走 I2C_NUM_0，但它只在 esp_camera_init() 期间写寄存器，
+ * 而 init 发生在采样任务启动**之前**（见 main.c 的调用顺序），所以两者不会撞。
+ */
+static SemaphoreHandle_t s_i2c_mtx;
+
 /* ---- 底层读写 ---- */
 
 esp_err_t qma7981_read_reg(uint8_t reg, uint8_t *val)
@@ -32,8 +51,15 @@ esp_err_t qma7981_read_reg(uint8_t reg, uint8_t *val)
     if (!s_inited || val == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    return i2c_master_transmit_receive(s_dev, &reg, 1, val, 1,
-                                       pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    if (s_i2c_mtx != NULL) {
+        xSemaphoreTake(s_i2c_mtx, portMAX_DELAY);
+    }
+    esp_err_t ret = i2c_master_transmit_receive(s_dev, &reg, 1, val, 1,
+                                                pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    if (s_i2c_mtx != NULL) {
+        xSemaphoreGive(s_i2c_mtx);
+    }
+    return ret;
 }
 
 static esp_err_t qma7981_write_reg(uint8_t reg, uint8_t val)
@@ -42,8 +68,15 @@ static esp_err_t qma7981_write_reg(uint8_t reg, uint8_t val)
         return ESP_ERR_INVALID_STATE;
     }
     uint8_t buf[2] = {reg, val};
-    return i2c_master_transmit(s_dev, buf, sizeof(buf),
-                               pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    if (s_i2c_mtx != NULL) {
+        xSemaphoreTake(s_i2c_mtx, portMAX_DELAY);
+    }
+    esp_err_t ret = i2c_master_transmit(s_dev, buf, sizeof(buf),
+                                        pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    if (s_i2c_mtx != NULL) {
+        xSemaphoreGive(s_i2c_mtx);
+    }
+    return ret;
 }
 
 /* ---- 数据换算 ----
@@ -78,6 +111,15 @@ static inline int16_t qma7981_compose(uint8_t lsb, uint8_t msb)
 esp_err_t qma7981_init(uint8_t *chip_id_out)
 {
     esp_err_t ret;
+
+    /* 0) 先建互斥锁 —— 下面第 3 步就要读寄存器了，锁必须已经就位 */
+    if (s_i2c_mtx == NULL) {
+        s_i2c_mtx = xSemaphoreCreateMutex();
+        if (s_i2c_mtx == NULL) {
+            ESP_LOGE(TAG, "创建 I2C 互斥锁失败（内存不足）");
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     /* 1) 创建 I2C 主机总线
      *    S3-EYE 的 SDA/SCL 无外部上拉电阻，必须启用芯片内部上拉。
@@ -183,8 +225,16 @@ esp_err_t qma7981_read(qma7981_sample_t *out)
     /* 一次性连读 0x01~0x06 共 6 字节，减少 I2C 事务次数 */
     uint8_t raw[6] = {0};
     uint8_t reg = QMA7981_REG_X_LSB;
+    /* ★ 必须持锁：这 6 个字节是两次时序拼起来的，中间被别的任务插进来就会读到
+     *   半新半旧的数据 —— 而且不报错，只在波形上冒个尖刺，很容易被当成噪声放过。 */
+    if (s_i2c_mtx != NULL) {
+        xSemaphoreTake(s_i2c_mtx, portMAX_DELAY);
+    }
     esp_err_t ret = i2c_master_transmit_receive(s_dev, &reg, 1, raw, sizeof(raw),
                                                 pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    if (s_i2c_mtx != NULL) {
+        xSemaphoreGive(s_i2c_mtx);
+    }
     if (ret != ESP_OK) {
         return ret;
     }

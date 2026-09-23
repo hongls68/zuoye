@@ -15,6 +15,10 @@ server/snapshots/
 server/tmpdata*/
 tmpdata*/
 
+# 演示用的隔离数据目录（临时起实例做截图核验时用，同样不入库）
+server/tmpdemo*/
+tmpdemo*/
+
 # Python
 __pycache__/
 *.pyc

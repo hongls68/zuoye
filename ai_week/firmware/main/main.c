@@ -44,6 +44,7 @@
 #include "qma7981.h"
 #include "camera.h"
 #include "help_btn.h"
+#include "wave.h"
 
 static const char *TAG = "app";
 
@@ -232,6 +233,47 @@ static void make_device_timestamp(char *buf, size_t len)
         /* 未对时时绝不编造日期，用运行时长表达 */
         snprintf(buf, len, "uptime+%.3fs(time_not_synced)",
                  esp_timer_get_time() / 1000000.0);
+    }
+}
+
+/*
+ * 生成"距现在 us_ago 微秒之前"的时刻，口径与 make_device_timestamp 一致。
+ *
+ * 【为什么需要它 —— 波形的时间轴跟别处不一样】
+ *   波形要回答的是"样本之间隔多久"，是个**相对间隔**。
+ *   wave.c 里每个样本只记了 esp_timer 微秒（开机以来的单调时刻），
+ *   它不知道 SNTP 对时成没成功，也不该知道 —— 换算放在这里，这里才有 s_time_synced。
+ *
+ *   关键在于：t_first 和 t_last 是**用同一个钟、按同一套换算**得出来的，
+ *   所以服务端拿它们做差是准的 —— 板钟差多少（哪怕差一整天）都自动抵消。
+ *   这就是为什么波形可以用板端时刻摆横轴，而不违反"服务端不采信板端时间"那条铁律：
+ *   那条铁律管的是**判定**（入库时刻、证据校验、超时归因），不是相对间隔。
+ *
+ *   没对时时同样退化成 uptime 秒数并标注 —— 服务端解析不出来会自己换一种摆法，
+ *   绝不会把 "uptime+12.3s" 当成某个 1970 年的时刻。
+ */
+static void make_timestamp_ago(int64_t us_ago, char *buf, size_t len)
+{
+    if (us_ago < 0) {
+        us_ago = 0;                 /* 时钟回绕或算出负数时夹到 0，不倒着走 */
+    }
+    if (s_time_synced) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        /* 先按整数秒/微秒分开减，避免 us_ago 超过 32 位 suseconds_t 的范围 */
+        tv.tv_sec  -= (time_t)(us_ago / 1000000);
+        tv.tv_usec -= (suseconds_t)(us_ago % 1000000);
+        while (tv.tv_usec < 0) {
+            tv.tv_usec += 1000000;
+            tv.tv_sec  -= 1;
+        }
+        struct tm tm_info;
+        localtime_r(&tv.tv_sec, &tm_info);
+        char base[32];
+        strftime(base, sizeof(base), "%Y-%m-%dT%H:%M:%S", &tm_info);
+        snprintf(buf, len, "%s.%03ld+08:00", base, (long)(tv.tv_usec / 1000));
+    } else {
+        snprintf(buf, len, "uptime+%.3fs(time_not_synced)", us_ago / 1000000.0);
     }
 }
 
@@ -434,6 +476,136 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    return err;
+}
+
+/* ---------------- 三轴波形批量上传（第5周）----------------
+ *
+ * 一批 = WAVE_BATCH_SAMPLES 个样本（默认 100 点 @20Hz = 5 秒）。
+ * 报文里带的每一个字段都有用处，没有一个是"顺手加上"的：
+ *
+ *   samples   原始 ADC 计数（**不是**换算后的 g）——
+ *             换算是可逆的，服务端拿原始值可以按任意系数重算，
+ *             反过来拿 g 值就永远回不到原始计数了。
+ *   lsb_per_g 手册标称灵敏度（±8g 量程 = 1024）
+ *   calib     实测标定系数（0.8078）
+ *             ★ 这两个**分开报**，不要只报一个融合后的 scale：
+ *               以后要回答"这个偏差是量程选错还是零点没标"，两个都得在。
+ *   t_first / t_last  批内首末样本的板端时刻（只用于摆横轴，服务端不拿它做判定）
+ *   dropped   攒这批期间丢掉的样本数。服务端靠它判断能不能用采样率反推时间轴 ——
+ *             批间有洞时累加就不成立。**丢了就要报，不能抹平成 0。**
+ *   batch_seq 批号（开机内递增）。服务端靠它判断批与批之间有没有断开。
+ *
+ * 失败不致命：下一批会重试，不阻塞其它通道。
+ */
+static esp_err_t upload_wave_batch(const wave_batch_t *b)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "device_id", DEVICE_ID);
+    cJSON_AddStringToObject(root, "sensor", "qma7981_accel");
+    cJSON_AddStringToObject(root, "unit", "g");
+    cJSON_AddStringToObject(root, "boot_id", s_boot_id);
+    cJSON_AddNumberToObject(root, "batch_seq", b->batch_seq);
+    cJSON_AddNumberToObject(root, "hz", WAVE_HZ);
+    cJSON_AddNumberToObject(root, "dropped", b->dropped);
+    cJSON_AddNumberToObject(root, "lsb_per_g", QMA7981_LSB_PER_G);
+    cJSON_AddNumberToObject(root, "calib", QMA7981_CALIB_SCALE);
+
+    int64_t now_us = esp_timer_get_time();
+    char t_first[48], t_last[48];
+    make_timestamp_ago(now_us - b->t_first_us, t_first, sizeof(t_first));
+    make_timestamp_ago(now_us - b->t_last_us, t_last, sizeof(t_last));
+    cJSON_AddStringToObject(root, "t_first", t_first);
+    cJSON_AddStringToObject(root, "t_last", t_last);
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "samples");
+    if (arr == NULL) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < b->n; i++) {
+        cJSON *tri = cJSON_CreateArray();
+        if (tri == NULL) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
+        cJSON_AddItemToArray(tri, cJSON_CreateNumber(b->xyz[i * 3 + 0]));
+        cJSON_AddItemToArray(tri, cJSON_CreateNumber(b->xyz[i * 3 + 1]));
+        cJSON_AddItemToArray(tri, cJSON_CreateNumber(b->xyz[i * 3 + 2]));
+        cJSON_AddItemToArray(arr, tri);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char url[192];
+    snprintf(url, sizeof(url), "%s/api/waveform", SERVER_URL);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = WAVE_UPLOAD_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        free(payload);
+        return ESP_FAIL;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    /* 保留 esp_http_client_open() 的原始错误码，不要统一压成 ESP_FAIL（见 upload_frame 的注释）*/
+    esp_err_t err = esp_http_client_open(client, strlen(payload));
+    if (err == ESP_OK) {
+        int written = esp_http_client_write(client, payload, strlen(payload));
+        if (written < 0) {
+            err = ESP_FAIL;
+        } else {
+            err = esp_http_client_fetch_headers(client);
+        }
+    }
+
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        if (status >= 200 && status < 300) {
+            /*
+             * 服务端会把算好的姿态回给我们。打到串口有两个用处：
+             *   1) 现场演示时不用开网页就知道板子现在是什么姿态；
+             *   2) 网页显示不对时，可以一眼看出是板端传错了还是服务端算错了。
+             */
+            char resp[256];
+            int n = esp_http_client_read(client, resp, sizeof(resp) - 1);
+            if (n < 0) {
+                n = 0;
+            }
+            resp[n] = '\0';
+            ESP_LOGI(TAG, "波形批次 #%lu 上传成功 (HTTP %d, %d 点, 丢 %lu)",
+                     (unsigned long)b->batch_seq, status, (int)b->n,
+                     (unsigned long)b->dropped);
+            if (n > 0) {
+                ESP_LOGI(TAG, "  服务端判定: %s", resp);
+            }
+            /* 上面最多读走 256 字节，剩下的必须排空（见 http_drain_body 注释）*/
+            http_drain_body(client);
+        } else {
+            ESP_LOGE(TAG, "波形批次 #%lu 服务器返回异常状态码 %d",
+                     (unsigned long)b->batch_seq, status);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "波形批次 #%lu 上传失败: %s",
+                 (unsigned long)b->batch_seq, esp_err_to_name(err));
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(payload);
     return err;
 }
 
@@ -731,6 +903,26 @@ void app_main(void)
              HELP_BTN_GPIO, HELP_LONG_PRESS_MS);
 #endif
 
+    /*
+     * 第5周：启动波形采样任务。
+     *
+     * 【为什么放在这里，而不是更早的硬件初始化之后】
+     *   采样任务是 20Hz 连轴转的，而环形缓冲只有 25.6 秒容量。
+     *   上面连 Wi-Fi（最多 20s）+ 对时（最多 10s）加起来可能超过 25 秒 ——
+     *   如果那会儿就开始采样，缓冲一开张就溢满，第一批报文直接带着 dropped 出门，
+     *   服务端就只能退回到最差的那条时间轴。等网络就绪了再开始采，
+     *   这段时间本来也传不出去，早采没有意义。
+     */
+#if WAVE_ENABLE
+    if (wave_init() != ESP_OK) {
+        ESP_LOGW(TAG, "波形采样启动失败，网页上的示波器会没有数据（其余功能不受影响）");
+    } else {
+        ESP_LOGI(TAG, "波形采样已启用：%d Hz × %d 点 = 每 %d 秒一批，缓冲 %d 点",
+                 WAVE_HZ, WAVE_BATCH_SAMPLES, WAVE_BATCH_SAMPLES / WAVE_HZ,
+                 WAVE_RING_SAMPLES);
+    }
+#endif
+
     /* 6) 主循环 */
     uint32_t fail_streak = 0;
 #if CAMERA_ENABLE
@@ -816,6 +1008,29 @@ void app_main(void)
             fail_streak++;
             ESP_LOGW(TAG, "连续上传失败 %lu 次", (unsigned long)fail_streak);
         }
+
+        /*
+         * 第5周：波形批次上传。
+         *
+         * 不用自己计时 —— wave_take_batch() 攒不够一批会返回 NULL，
+         * 20Hz × 100 点自然就是 5 秒一批，它自己就是节拍器。
+         *
+         * 【发失败了为什么不重发】
+         *   批号在**取走的那一刻**就自增过了（见 wave.c），所以这一批没送达时，
+         *   服务端会看到批号从 6 跳到 8 —— 它据此知道"中间少了一段"，
+         *   不会把 7 和 9 当成连续的。反过来若改成"发成功才自增"，
+         *   失败就会留下一个看不出来的洞，时间轴会被摆错还显得很正常。
+         *   波形是**过程数据**，丢一批只少一段画面，不值得为它重试到阻塞主循环。
+         */
+#if WAVE_ENABLE
+        if (s_wifi_connected) {
+            const wave_batch_t *wb = wave_take_batch();
+            if (wb != NULL && upload_wave_batch(wb) != ESP_OK) {
+                ESP_LOGW(TAG, "波形批次 #%lu 未送达（服务端会看到批号断档）",
+                         (unsigned long)wb->batch_seq);
+            }
+        }
+#endif
 
         /* 摄像头：按 CAMERA_PERIOD_MS 周期性抓帧并上传（独立于加速度节奏）*/
 #if CAMERA_ENABLE
