@@ -35,13 +35,13 @@ ai_week/
 ├── server/                    ← 服务端（跑在你自己的电脑上，替代 VPS）
 │   ├── server.py              ← 接收、存储、查询、指令通道、求助事件、问答接口、波形与姿态、画廊与配额清理，纯标准库无依赖
 │   ├── index.html             ← Web 展示页面（实时数值 + 远程采集 + 教学求助 + 自然语言问答 + 传感器示波器 + 照片画廊）
-│   ├── nl_agent.py            ← 第4周：受限工具 + 运行时模型调用 + 防"假成功"出口守卫
+│   ├── nl_agent.py            ← 第4周：受限工具（9 个）+ 运行时模型调用 + 出口守卫（假成功 / 航向）
 │   ├── selftest_command.py    ← 指令状态机自测（不接板子也能跑，25 项断言）
 │   ├── selftest_gallery.py    ← 画廊与配额清理自测（自起隔离实例，20 项断言）
 │   ├── selftest_help.py       ← 第3周：按键求助三层状态自测（自起隔离实例，15 组断言）
 │   ├── walkthrough_help.py    ← 第3周：同伴操作走查引导（系统状态自动抓取，人的判断由人手写）
-│   ├── selftest_nl.py         ← 第4周：受限工具层自测（不调模型，17 组断言）
-│   ├── selftest_wave.py       ← 第5周：波形入库 / 姿态判定 / 时间轴三档自测（自起隔离实例，11 组断言）
+│   ├── selftest_nl.py         ← 第4周：受限工具层自测（不调模型，21 组断言）
+│   ├── selftest_wave.py       ← 第5周：波形入库 / 姿态判定 / 时间轴三档自测（自起隔离实例，11 组主断言 + 3b/3c/7b）
 │   ├── selftest_page.js       ← 网页层静态校验（Node 跑，语法 / DOM id / 接口路由 / 渲染）
 │   ├── snapshots/             ← 摄像头帧落盘目录（原图按配额清理，latest.jpg 常驻）
 │   └── data.db                ← SQLite 数据库（首次运行自动创建）
@@ -367,11 +367,12 @@ EXPIRED            TIMEOUT            TIMEOUT          （设备显式报错 →
 运行时模型：本机 Ollama `http://127.0.0.1:11434`，模型 `smtek/Qwen3.8-27B:Q2_K_XL-12gb`（支持 tool calling）。
 
 **★ 两个角色必须分清**：写这份代码的 AI 是**开发助手**（开发期，用户看不见）；
-`/api/ask` 里被调用的 Ollama 是**产品运行时模型**（运行期，只看得见 7 个受限工具，
+`/api/ask` 里被调用的 Ollama 是**产品运行时模型**（运行期，只看得见 9 个受限工具，
 看不见仓库、也看不见开发期的对话）。
 
-**★ 受限工具（7 个，6 个只读）**：`list_devices` / `get_latest_reading` / `query_readings` /
-`query_frames` / `get_command_status` / `list_help_events` / `request_capture`。
+**★ 受限工具（9 个，8 个只读）**：`list_devices` / `get_latest_reading` / `query_readings` /
+`query_frames` / `get_command_status` / `list_help_events` /
+`get_attitude` / `query_waveform` / `request_capture`。
 模型**没有自由写 SQL 的能力** —— 不是被限制，是根本没有这个入口。
 只读守卫拦 `INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/PRAGMA/VACUUM` 与 `SELECT *`；
 行数上限 `MAX_ROWS=200` 由服务端定，不由模型定；`device_id` 必须在库里确实出现过。
@@ -387,7 +388,7 @@ EXPIRED            TIMEOUT            TIMEOUT          （设备显式报错 →
 
 命令行：`python nl_agent.py "板子最近一次的加速度是多少"`、`python nl_agent.py --tools`。
 
-自测：`python selftest_nl.py`（17 组断言，**不调模型** —— 模型是概率性的，工具层必须是确定性的）
+自测：`python selftest_nl.py`（21 组断言，**不调模型** —— 模型是概率性的，工具层必须是确定性的）
 与 `node selftest_page.js`（网页层静态校验）。
 第 17 组就是课程要求的「**无响应记录**」：设备离线时逐环断言
 "已下发"是真的成功、"采集完成"不是，且超时只记 `EXPIRED`（找人）不记 `FAILED`。
@@ -421,8 +422,14 @@ EXPIRED            TIMEOUT            TIMEOUT          （设备显式报错 →
 板端环形缓冲溢出时**如实上报丢了多少样本**（`dropped`），
 服务端看到非 0 就不再反推 —— 因为"批间有洞"时累加不成立。
 
-自测：`python selftest_wave.py`（自起隔离实例，11 组断言）
+自测：`python selftest_wave.py`（自起隔离实例，11 组主断言 + 3b/3c/7b，共 14 段）
 与 `node selftest_page.js`（第 6 组 15 条，含孪生的 11 条**几何断言**）。
+
+**★ 这两块数据同样接进了第 4 周的自然语言问答**（`get_attitude` / `query_waveform` 两个只读工具）。
+接的过程踩到过一处"自己给自己挖的坑"：新加一张表，**光加接口是不够的** ——
+① 设备白名单得跟着扫这张表，否则只传波形的设备会被判成"根本没这台设备"；
+② 提示词里得补上口径，否则模型面对"板子朝哪边"只会留空或编个 `0°`。
+三处都补齐了，自测第 18~21 组盯着，课堂验证见「六之三 · 第 7 步」。
 
 ---
 
@@ -587,7 +594,7 @@ python walkthrough_help.py            # 默认走查 http://127.0.0.1:8000
 
 ```bash
 cd server
-python selftest_nl.py                       # 16 组断言，不调模型
+python selftest_nl.py                       # 21 组断言，不调模型
 node selftest_page.js                       # 网页层静态校验（需要 Node）
 ```
 
@@ -611,6 +618,8 @@ curl --noproxy '*' http://127.0.0.1:8000/api/ask/health     # 看服务端认不
 | `有哪些设备` | 调 `list_devices` | 有没有把自测遗留设备标出来 |
 | `板子最近一次的加速度是多少` | 调 `get_latest_reading` | 有没有报 `source` / `time` / `state` |
 | `s3eye-group01 最近一小时有多少条数据` | 调 `query_readings(since=1h)` | 空结果时说的是"查不到"还是"设备坏了" |
+| `板子现在是什么姿态，合加速度是多少` | 调 `get_attitude` | 有没有报 `pitch` / `roll` / `acc_mag` |
+| `板子朝哪个方向，航向是多少` | 调 `get_attitude` | **★ 会不会答"不可测"并给原因**（而不是 0°） |
 | `让板子现在拍一张，然后告诉我拍好了没` | 调 `request_capture` + `get_command_status` | **★ 会不会说"已采集成功"** |
 
 ### 第 4 步：★ 验证"无证据不报成功"
@@ -634,6 +643,26 @@ curl --noproxy '*' http://127.0.0.1:8000/api/ask/health     # 看服务端认不
 问 `让板子现在拍一张`（**不指定设备**）。库里有多台设备时，
 期望它先调 `list_devices` 然后**反问你要哪一台**，而不是自己挑一台就下发。
 
+### 第 7 步：★ 验证"原理上测不到"这件事守住了
+
+第 5 周的姿态数据接进问答之后，多了一处必须守住的边界：
+
+> 本板无陀螺仪/磁力计，**航向（绕重力轴自转）不可测**。
+
+| 问什么 | 期望 | 关键看什么 |
+|---|---|---|
+| `板子现在是什么姿态` | 报 `posture` / `pitch` / `roll` / `acc_mag` | 有没有说"这是**某一批数据**的属性" |
+| `板子朝哪个方向，航向是多少` | **答"不可测"并给原因** | 有没有编一个 `0°`（`0°` 就是正北） |
+| `最近几批波形有没有丢样本` | 调 `query_waveform` | 有没有报 `dropped_total`；**不该吐原始样本** |
+
+自测里对应的两组：`python selftest_nl.py` 搜 `第5周接入`（白名单）与
+`问到航向时不许编一个角度`（出口守卫 `yaw_fabricated`）。
+守卫只该拦越界 —— 同组还断言了"如实说不可测**不误伤**""没问航向时报俯仰/横滚**不误伤**"。
+
+**这一组最值得讲的不是"守卫拦住了"，而是"守卫没被触发"。**
+真模型自己就答对了，说明**口径写在提示词里是有用的**；
+守卫被触发说明的从来不是守卫强，而是上游没交代清楚。
+
 ---
 
 ## 六之四、第 5 周：传感器示波器的课堂验证
@@ -642,7 +671,7 @@ curl --noproxy '*' http://127.0.0.1:8000/api/ask/health     # 看服务端认不
 
 ```bash
 cd ai_week/server
-python selftest_wave.py     # 自起隔离实例，11 组断言，跑完自删
+python selftest_wave.py     # 自起隔离实例，11 组主断言 + 3b/3c/7b，跑完自删
 node selftest_page.js       # 网页层，含孪生的 11 条几何断言
 ```
 
@@ -981,7 +1010,7 @@ curl --noproxy '*' http://127.0.0.1:11434/api/tags
     回答里必须报"数据来自哪个接口、什么时刻、什么状态"。
     模型手里没有这三样就只能编 —— 所以这三样是**工具必须给的**，不是模型自己找的。
 36. **区分"开发助手"与"产品运行时模型"**：写这份代码的 AI 在开发期参与，用户看不见；
-    `/api/ask` 里被调用的 Ollama 在运行期工作，**只看得见 7 个受限工具**，
+    `/api/ask` 里被调用的 Ollama 在运行期工作，**只看得见 9 个受限工具**，
     看不见仓库、注释、开发期对话。这个区分决定了系统提示词必须把规则写全 ——
     不能假设"模型应该知道"。
 37. **设备白名单按"库里确实出现过"判定，并区分"没这台设备"与"设备没数据"**：

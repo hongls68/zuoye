@@ -351,17 +351,23 @@
       <button data-q="板子最近一次的加速度是多少">最新读数</button>
       <button data-q="s3eye-group01 最近一小时有多少条数据，ax 最大值是多少">带时间范围查询</button>
       <button data-q="有没有待回应的教学求助">待回应的求助</button>
+      <button data-q="板子现在是什么姿态，合加速度是多少">最新姿态（第5周）</button>
+      <button data-q="板子朝哪个方向，航向是多少">★ 问航向（应答「不可测」）</button>
       <button data-q="让板子现在拍一张，然后告诉我拍好了没">★ 请求一次新采集</button>
     </div>
     <div class="asklog" id="askLog"></div>
     <div class="camnote">
       这一块由**产品运行时模型**（本机 Ollama）驱动，和写这份代码的开发助手是两个角色 ——
-      它只看得见 7 个受限工具，看不见仓库、也看不见开发期的对话。
+      它只看得见 9 个受限工具，看不见仓库、也看不见开发期的对话。
       所以每个回答下面都挂着**工具调用链**：调了哪个工具、参数是什么、数据来自哪个接口、
       什么时刻、什么状态。没有调用链的回答，就是没有依据的回答。<br>
       ★ 特别注意「请求一次新采集」：下完指令只会得到 <b>PENDING</b>（设备还没来取），
       <b>在没有 COMPLETED 证据之前，它不会说"已采集成功"</b>。
-      如果模型硬说，出口守卫会把那句话拦下来并替换成实际状态。
+      如果模型硬说，出口守卫会把那句话拦下来并替换成实际状态。<br>
+      ★ 还有一处边界：「板子朝哪个方向」是<b>问不出答案</b>的 ——
+      本板无陀螺仪/磁力计，航向在原理上不可测。模型若报 0° 或用俯仰/横滚顶上，
+      出口守卫同样会拦下（标记 <span class="code">yaw_fabricated</span>）并改成原理说明。
+      <b>「不可测」和「没采到」是两件事</b>，页面和回答都要分清楚。
     </div>
   </section>
 
@@ -959,7 +965,8 @@
   var GUARD_LABEL = {
     success_without_evidence: '已拦下「无证据的假成功」',
     no_tool_used: '未调用任何工具，数字无来源',
-    clarification_skipped: '该反问却没反问（已补提醒）'
+    clarification_skipped: '该反问却没反问（已补提醒）',
+    yaw_fabricated: '已拦下「把不可测的航向说成测到了」'
   };
 
   function askHealth() {

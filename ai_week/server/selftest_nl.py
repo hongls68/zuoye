@@ -10,11 +10,14 @@
   2. 校验：设备范围、行数上限、时间格式，非法一律拒，且**拒得说人话**
   3. 歧义：设备不唯一/没说清 → 要求反问，不许替用户挑
   4. ★ 防假成功：没有 COMPLETED 证据时，任何"已采集成功"的说法都要被拦下
+  5. ★ 第 5 周数据接进来了吗：只上传波形的设备算不算"已知设备"、
+     姿态工具带不带 yaw=null 的边界、问到航向时模型能不能编一个角度
 
 运行：python selftest_nl.py
 （自建临时数据库，跑完自删；不依赖真实板子，也不调 Ollama）
 """
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -95,6 +98,55 @@ def main() -> int:
         "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("help-1", "board-A", "teach_help_test", "LOCAL_ACKED", "RECEIVED",
          "PENDING", iso(3), iso(3), "boot1", 8, iso(3)))
+
+    # ---- 第 5 周数据：波形批次（用来验证姿态/波形有没有真的接进问答层）----
+    #
+    # ★ 姿态/俯仰/横滚一律调 server 里那两个函数来算，**不在这里另写一份** ——
+    #   自测若自己算一套，两边口径漂了也看不出来，等于白测。
+    def add_wave(dev, seq, boot, n, hz, dropped, t_last, mins_ago,
+                 ax, ay, az, samples=None):
+        posture, _label, _en, note = server.classify_posture(ax, ay, az)
+        pitch, roll = server.tilt_angles(ax, ay, az)
+        mag = math.sqrt(ax * ax + ay * ay + az * az)
+        conn.execute(
+            "INSERT INTO wave_batches(device_id, boot_id, batch_seq, hz, n_samples, "
+            "lsb_per_g, calib, scale, t_first, t_last, dropped, received_at, samples, "
+            "ax_raw, ay_raw, az_raw, ax, ay, az, acc_mag, pitch, roll, posture, "
+            "posture_note, yaw, yaw_note) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dev, boot, seq, hz, n, 1024.0, 0.8078, 1.0 / (1024.0 * 0.8078),
+             t_last, t_last, dropped, iso(mins_ago),
+             samples if samples is not None else "0,0,1000;" * n,
+             0, 0, 1000, ax, ay, az, round(mag, 4), pitch, roll, posture,
+             note, None, server.YAW_NOTE))
+
+    # board-A：3 批连号、同一开机、无丢样本，且**板端时间戳不可解析**
+    #          （本板 SNTP 常年对不上时就是这种串）→ 时间轴应走 derived 那一档
+    NOT_SYNCED = "uptime+12.345s(time_not_synced)"
+    for i, (mins, a) in enumerate(((30, (0.02, -0.71, 0.70)),
+                                   (25, (0.02, -0.71, 0.70)),
+                                   (20, (0.02, -0.71, 0.70)))):
+        add_wave("board-A", i + 1, "bootW1", 100, 20, 0, NOT_SYNCED, mins, *a)
+    # board-B：批号 1 → 5，中间断了（有批没送达）→ 只能退回 server 那一档
+    add_wave("board-B", 1, "bootW2", 100, 20, 0, NOT_SYNCED, 30, 0.0, 0.0, 1.0)
+    add_wave("board-B", 5, "bootW2", 100, 20, 0, NOT_SYNCED, 20, 0.0, 0.0, 1.0)
+    # 只上传波形、**一条 readings 都没有**的设备 ——
+    # 这是第 5 周接进来时最容易漏的一环：known_devices 不扫 wave_batches
+    # 的话，这台设备会被判成"根本没这台设备"，而它明明正在正常上传。
+    add_wave("wave-only-board", 1, "bootW3", 100, 20, 0, NOT_SYNCED, 30,
+             0.0, 1.0, 0.0)
+    add_wave("wave-only-board", 2, "bootW3", 100, 20, 7, NOT_SYNCED, 25,
+             0.0, 1.0, 0.0)          # 板端如实上报丢了 7 个样本
+    # 只有一批 → 谈不上"批间连续"
+    add_wave("one-batch-board", 1, "bootW4", 100, 20, 0, NOT_SYNCED, 10,
+             0.0, 0.0, 1.0)
+    # 纯 readings 设备：用来验"这台设备还没有波形数据"那条分支
+    conn.execute(
+        "INSERT INTO readings(device_id, sensor, unit, ax, ay, az, ts_device, "
+        "ts_server, ax_raw, ay_raw, az_raw, is_new_sample, time_synced) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("readings-only-board", "qma7981", "g", 0.0, 0.0, 1.0, iso(2), iso(2),
+         0, 0, 1000, 1, 1))
     conn.commit()
 
     print("\n== 1. 受限：工具白名单 ==")
@@ -362,6 +414,121 @@ def main() -> int:
     print("  [INFO] 这一组就是课程要求的『无响应记录』：")
     print("         request_id=%s → PENDING → EXPIRED（has_frame=False，"
           "success_claim_allowed=False）" % rid2)
+
+    print("\n== 18. ★ 第5周接入：只上传波形的设备也必须算「已知设备」==")
+    # 这是"加了一张表却忘了扫"的回归测试。漏掉的后果很隐蔽：
+    # 一台正在正常上传波形的设备，会被判成"根本没这台设备"。
+    known = nl.known_devices(conn)
+    check("wave-only-board 在已知设备名单里（白名单扫了 wave_batches）",
+          "wave-only-board" in known, known)
+    r = nl.execute_tool("get_attitude", {"device_id": "wave-only-board"}, conn)
+    check("只上传波形的设备能查到姿态（不是被判成'没这台设备'）",
+          r["ok"] is True and r.get("state") == "ok", r.get("error"))
+    r = nl.execute_tool("get_attitude", {"device_id": "board-ZZZ"}, conn)
+    check("不存在的设备仍然被拒（白名单没有放松）", r["ok"] is False)
+
+    print("\n== 19. ★★ 姿态：能测的给数，测不到的必须明说（不许留空，也不许给 0）==")
+    r = nl.execute_tool("get_attitude", {"device_id": "board-A"}, conn)
+    d = r["data"]
+    check("给出姿态 key 与中文标签",
+          d["posture"] in server.POSTURE_LABEL and bool(d["posture_label"]),
+          (d["posture"], d["posture_label"]))
+    check("给出合加速度 |a|（静止时 ≈ 1 g）",
+          d["acc_mag"] is not None and 0.9 < d["acc_mag"] < 1.1, d["acc_mag"])
+    check("给出俯仰/横滚（由重力向量反算）",
+          d["pitch"] is not None and d["roll"] is not None,
+          (d["pitch"], d["roll"]))
+    check("★ yaw 恒为 None —— 不是 0，也不是干脆没这个字段",
+          "yaw" in d and d["yaw"] is None, d.get("yaw"))
+    check("★ 并且带 yaw_note 说明为什么（不是没采到，是测不到）",
+          "不可测" in (d.get("yaw_note") or ""), d.get("yaw_note"))
+    check("顶层也重复一份 yaw / yaw_note（模型常常只看顶层）",
+          r.get("yaw") is None and "不可测" in (r.get("yaw_note") or ""))
+    check("说明姿态的依据是重力方向", "重力" in (r.get("basis") or ""), r.get("basis"))
+    check("时间口径：received_at 是服务端的钟、t_last 只作参考",
+          "服务端" in r["time_semantics"]["received_at"]
+          and "不采信" in r["time_semantics"]["t_last"], r["time_semantics"])
+    r = nl.execute_tool("get_attitude", {"device_id": "readings-only-board"}, conn)
+    check("没有波形数据的设备 → 明确报空，且**不**断言'从没上报过'",
+          r["ok"] is False and "从未上传" in r["error"] and "清理" in r["error"],
+          r.get("error"))
+    check("并把'波形会被滚动清理'这条策略一起交出去",
+          "滚动清理" in (r.get("wave_retention") or ""), r.get("wave_retention"))
+
+    print("\n== 20. ★ 波形摘要：不吐原始样本，时间轴三档如实说明 ==")
+    r = nl.execute_tool("query_waveform", {"device_id": "board-A", "limit": 10}, conn)
+    d = r["data"]
+    check("返回的是批次摘要，**不含原始样本**",
+          d.get("samples_omitted") is True
+          and all("samples" not in b for b in d["batches"]), list(d["batches"][0]))
+    check("并说明为什么不给样本（能吐多少由服务端定，不由模型定）",
+          "模型" in d["samples_omitted_reason"], d["samples_omitted_reason"][:46])
+    check("摘要带批号/点数/采样率/丢样本数",
+          all(k in d["batches"][0] for k in
+              ("batch_seq", "n_samples", "hz", "dropped")), list(d["batches"][0]))
+    check("摘要按时间正序（老的在前，与网页画波形一致）",
+          [b["batch_seq"] for b in d["batches"]] == [1, 2, 3],
+          [b["batch_seq"] for b in d["batches"]])
+    check("统计里有批数与丢样本合计",
+          d["summary"]["batch_count"] == 3 and d["summary"]["dropped_total"] == 0,
+          d["summary"])
+    check("★ board-A：板端时间戳不可解析但批号连续 → 时间轴走 derived（按采样率反推）",
+          d["time_axis_source"] == "derived", d["time_axis_source"])
+    check("并说明这一档为什么可信", "反推" in d["time_axis_note"], d["time_axis_note"])
+
+    r = nl.execute_tool("query_waveform", {"device_id": "board-B"}, conn)
+    check("★ board-B：批号断档 → 退回 server 那一档",
+          r["data"]["time_axis_source"] == "server", r["data"]["time_axis_source"])
+    check("★ 降级原因写的是'断档'，不是笼统一句'不可靠'",
+          "断档" in r["data"]["time_axis_note"], r["data"]["time_axis_note"])
+
+    r = nl.execute_tool("query_waveform", {"device_id": "wave-only-board"}, conn)
+    check("★ 板端如实报了丢样本 → 同样不能按采样率反推",
+          r["data"]["time_axis_source"] == "server"
+          and "丢样本" in r["data"]["time_axis_note"],
+          (r["data"]["time_axis_source"], r["data"]["time_axis_note"]))
+    check("dropped_total 如实是 7（没被 `or 0` 之类吞掉）",
+          r["data"]["summary"]["dropped_total"] == 7,
+          r["data"]["summary"]["dropped_total"])
+    check("并说明 dropped 非 0 意味着什么",
+          "如实" in (r.get("dropped_note") or ""), r.get("dropped_note"))
+
+    r = nl.execute_tool("query_waveform", {"device_id": "one-batch-board"}, conn)
+    check("★ 只有一批 → 原因写'只有一批'，不是'批号断档'",
+          r["data"]["time_axis_source"] == "server"
+          and "只有一批" in r["data"]["time_axis_note"],
+          r["data"]["time_axis_note"])
+
+    r = nl.execute_tool("query_waveform", {"device_id": "readings-only-board"}, conn)
+    check("没有波形的设备 → 明确报空（与'没这台设备'分开）",
+          r["ok"] is False and "没有波形批次" in r["error"], r.get("error"))
+
+    print("\n== 21. ★★ 结果守卫：问到航向时不许编一个角度 ==")
+    # 航向是**原理上测不到**的量。模型最常见的两种糊弄在数字上都不假，
+    # 却会让用户以为"方向是测得到的"，所以这道守卫拦的不是"说错数"。
+    trace_w = [{"tool": "get_attitude", "state": "ok",
+                "result": {"ok": True, "state": "ok",
+                           "data": {"posture": "tilted", "yaw": None}}}]
+    g = nl.guard_answer("板子的航向是 0°，正北方向。", trace_w, "板子朝哪个方向")
+    check("拦下'航向 0°'（0° 就是正北，等于凭空造了个方向）",
+          "yaw_fabricated" in g["guardrails"], g["guardrails"])
+    check("更正文案给出原理上的原因（无陀螺仪 → 不可测）",
+          "不可测" in g["text"] and "陀螺仪" in g["text"], g["text"][:76])
+    check("并指出真正可测的是什么", "俯仰" in g["text"])
+    g = nl.guard_answer("板子朝东。", trace_w, "板子朝哪个方向")
+    check("★ 不给数字、只给方向词也拦（'朝东'同样没有任何依据）",
+          "yaw_fabricated" in g["guardrails"], g["guardrails"])
+    g = nl.guard_answer("姿态是自由倾斜，俯仰 -1.2°、横滚 -45.4°，"
+                        "航向不可测 —— 本板无陀螺仪/磁力计。", trace_w,
+                        "板子朝哪个方向")
+    check("★ 如实说'不可测'的正常回答不误伤（哪怕句子里有角度数字）",
+          g["guardrails"] == [], g["guardrails"])
+    g = nl.guard_answer("板子现在自由倾斜，俯仰 -1.2°、横滚 -45.4°。", trace_w,
+                        "板子现在什么姿态")
+    check("★ 没问航向时，报俯仰/横滚不算越界（不误伤）",
+          g["guardrails"] == [], g["guardrails"])
+    g = nl.guard_answer("姿态无法判定，读数缺失。", trace_w, "板子什么姿态")
+    check("读不到就如实说读不到 → 放行", g["guardrails"] == [], g["guardrails"])
 
     conn.close()
 

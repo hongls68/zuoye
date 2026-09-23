@@ -17,6 +17,17 @@
   它不知道的事，只能靠**工具返回的结构化结果**告诉它。所以工具返回什么，
   决定了它有没有可能说实话。
 
+【第 5 周数据接入 —— 这里踩过一个自己给自己挖的坑】
+  第 5 周新加了姿态与波形数据（wave_batches 表），但**同一个页面上的自然语言问答
+  一开始看不见它**：工具清单里没有相关工具，设备白名单也没扫这张表。
+  结果是"网页上画得出来、问答里问不出来" —— 同一份数据两套视野。
+  ★ 所以：**加一张表，就要同时问三件事** ——
+      ① 白名单（known_devices）扫了吗？ → 不扫，只传波形的设备会被判成"没这台设备"
+      ② 工具有吗？                     → 没有工具，模型只能干说"我查不到"
+      ③ 提示词里的口径写了吗？          → 前两条决定"能不能查到"，这条决定"查到了会不会说错"
+    第 ③ 条在姿态这块最典型：**航向在原理上不可测**（无陀螺仪/磁力计），
+    不写进提示词，模型面对"板子朝哪边"只会留空、或者干脆编一个 0°。
+
 【本文件的四条硬约束】
   1. 受限工具：模型只能调下面 TOOL_SPECS 里列出的工具，**没有自由写 SQL 的能力**。
      每个工具的参数都过白名单校验（设备范围、行数上限、时间格式），非法即拒。
@@ -67,6 +78,36 @@ OLLAMA_TIMEOUT = 180
 TEST_DEVICE_PREFIXES = ("selftest", "probe", "nl-", "demo-")
 TEST_DEVICE_MARKERS = ("selftest", "probe", "demo", "test", "-tmp")
 
+# ---- 第 5 周：姿态与波形的口径常量 ----
+#
+# ★ 这几个值**刻意在 server.py 里也有一份**，不 import 过来。
+#   原因：server.py 顶部 `import nl_agent`，nl_agent 再 import server 就成环。
+#   重复的代价是"改一处忘另一处"，所以下面那组自测会拿真库跑一遍，
+#   一旦两边口径不一致就会露出来。
+POSTURE_LABEL = {
+    "flat":      "平放",
+    "upright":   "竖直正面",
+    "side_edge": "侧边直立",
+    "tilted":    "自由倾斜",
+    "unknown":   "无法判定",
+}
+
+# ★ 本板测不到航向。这句话必须**跟着数据一起**交给模型 ——
+#   只在文档里写一遍没用，模型看不见文档。
+YAW_NOTE = ("本板无陀螺仪/磁力计：航向（绕重力轴自转）在原理上不可测，"
+            "不是没采到，也不是 0°")
+
+# 姿态是怎么算出来的 —— 模型回答时必须能说清依据，而不是把它当成"读出来的一个字段"
+ATTITUDE_BASIS = ("姿态由**重力方向**判定（加速度计静止时测的是支撑力，读数指向天空），"
+                  "所以凡由倾斜决定的状态都测得到；"
+                  "唯一测不到的是绕重力轴自转的航向。")
+
+# 波形是"过程数据"不是"证据" —— 和原图分岔的保留策略，模型得知道，
+# 否则会把"老波形被清理了"说成"设备从来没上报过波形"。
+WAVE_RETENTION_NOTE = ("波形属过程数据，服务端按每设备最近 N 批滚动清理（默认 720 批）；"
+                       "清理掉老批不等于设备没上报过。"
+                       "原图相反：元数据（含 SHA-256）永久保留，只清原图。")
+
 # 只读守卫：这些词出现在 SQL 里就直接拒。
 # 正常情况下工具用的是固定模板 SQL，根本不会碰到；留着是为了
 # "将来有人加工具时忘了守规矩"这一天的。
@@ -102,8 +143,13 @@ def known_devices(conn) -> list:
     那种空结果很容易被模型说成"设备没数据"，其实是"根本没这台设备"。
     """
     ids = set()
+    # ★ 这张表清单必须跟着"有 device_id 的表"一起长。
+    #   第 5 周加 wave_batches 时漏了这一步，后果很隐蔽：一台只上传波形、
+    #   还没上报过 readings 的设备，会被判成"根本没这台设备" ——
+    #   而它其实正在正常上传数据。所以下面加了一组自测盯着这件事。
     for table, col in (("readings", "device_id"), ("frames", "device_id"),
-                       ("commands", "device_id"), ("help_events", "device_id")):
+                       ("commands", "device_id"), ("help_events", "device_id"),
+                       ("wave_batches", "device_id")):
         try:
             for r in conn.execute("SELECT DISTINCT %s AS d FROM %s" % (col, table)):
                 if r["d"]:
@@ -184,6 +230,20 @@ def _parse_since(since, now=None):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
     return dt.isoformat(timespec="milliseconds")
+
+
+def _parse_iso_safe(s):
+    """能解析就返回 datetime，不能就返回 None（**不抛异常**）。
+
+    ★ 这里必须容错，因为板端在未对时的时候会把时间戳写成
+      `uptime+12.345s(time_not_synced)` —— 这种串 parse 不了。
+      板子 SNTP 对不上时是**常态**（第 1 周就实测到了），
+      所以"解析失败"是预期内的一种正常输入，不是异常。
+    """
+    try:
+        return datetime.fromisoformat(str(s))
+    except (TypeError, ValueError):
+        return None
 
 
 def _ok(source, data, time=None, state=None, **extra):
@@ -378,6 +438,178 @@ def t_list_help_events(conn, device_id=None, limit=None, **_):
                note="device_state=板子说的；server_state=服务端说的；viewer_state=人说的，三者不可互推")
 
 
+def _wave_axis_source(rows) -> tuple:
+    """这批波形的时间轴该走哪一档？返回 (source, note)。
+
+    ★ 判据与 server.py 的 `_wave_batches_contiguous()` **必须一致**，
+      那边有详细的推理过程，这里只说结论：
+        ① device   板端采样时刻 t_last 可解析且互不相同
+                   —— 板子的钟可能没对时，但**钟差是个常数**，做差后自动抵消
+        ② derived  批号逐批 +1 + 同一次开机 + 采样率一致 + **批间没丢样本**
+                   → 时间轴完全由 (n_samples, hz) 反推，一个时钟都不用
+        ③ server   兜底：用服务端接收时刻（含网络抖动）
+
+    ★ 三档都**不违反**"服务端不采信板端时间"那条铁律：
+      判定（入库、证据、超时归因）一律仍用 received_at；
+      这里只决定**相对间隔**怎么摆，且用了哪一档会一起交给模型。
+    """
+    if not rows:
+        return "none", "没有数据"
+    dev_times = [_parse_iso_safe(r["t_last"]) for r in rows]
+    if all(d is not None for d in dev_times) and len(set(dev_times)) > 1:
+        return "device", ("用板端采样时刻摆相对间隔 —— 钟差是常数，做差后自动抵消"
+                          "（判定仍用服务端 received_at）")
+
+    hz = rows[-1]["hz"]
+    # ★ 降级原因必须写准 —— "批号断档"和"只有一批"是两回事，
+    #   笼统写一句"时间轴不可靠"会让人去查一个根本不存在的丢批问题。
+    if len(rows) < 2:
+        return "server", "只有一批数据，谈不上批间连续，退回服务端接收时刻"
+    if any(r["dropped"] for r in rows):
+        return "server", ("板端如实上报了丢样本（批间有洞），累加不成立，"
+                          "退回服务端接收时刻 —— 网络抖动会让间隔看起来不匀")
+    if len({r["boot_id"] for r in rows}) != 1:
+        return "server", ("中间重启过（boot_id 变了），批号会归零，不能当连续，"
+                          "退回服务端接收时刻")
+    if len({r["hz"] for r in rows}) != 1 or not hz or hz < 1:
+        return "server", "采样率缺失或各批不一致，无法按采样率反推，退回服务端接收时刻"
+    for i, r in enumerate(rows):
+        if r["batch_seq"] is None:
+            return "server", "板端没报批号，无法判断批间是否连续，退回服务端接收时刻"
+        if i > 0 and r["batch_seq"] != rows[i - 1]["batch_seq"] + 1:
+            return "server", ("批号有断档（中间有批没送达），退回服务端接收时刻 —— "
+                              "网络抖动会让间隔看起来不匀")
+    return "derived", ("批号连续且批间无丢样本，按采样率反推时间轴"
+                       "（比服务端接收时刻准，不受网络抖动影响）")
+
+
+def t_get_attitude(conn, device_id=None, **_):
+    """取某台设备**最新姿态** —— 口径与 `GET /api/attitude` 完全一致。
+
+    ★ 这个工具存在的意义，一半是给数据，一半是给**边界**：
+      返回值里恒定带 `yaw: null` 和 `yaw_note`。
+      模型手里有了这两个字段，才可能说出"航向不可测"；
+      没有的话，它面对"板子朝哪边"就只剩留空和编造两条路。
+    """
+    chk = _check_device(conn, device_id)
+    if not chk["ok"]:
+        return _err("GET /api/attitude", chk["error"],
+                    needs_clarification=chk.get("needs_clarification", False),
+                    candidates=chk.get("candidates", []), hint=chk.get("hint"))
+    did = chk["device_id"]
+    rows = _run_readonly(
+        conn,
+        "SELECT id, device_id, boot_id, batch_seq, hz, n_samples, received_at, "
+        "t_first, t_last, ax, ay, az, acc_mag, pitch, roll, posture, posture_note "
+        "FROM wave_batches WHERE device_id=? ORDER BY id DESC LIMIT 1",
+        (did,), max_rows=1)
+    if not rows:
+        # ★ 这里有两种可能，必须都摆出来 —— 断言成"从没上传过"会把人带偏：
+        #   波形是按批滚动清理的，有可能设备传过、但老批（含最新那批）已被清掉。
+        return _err("GET /api/attitude",
+                    "该设备当前没有波形数据，因此算不出姿态。"
+                    "可能是①设备从未上传过波形（板端 WAVE_ENABLE 没开），"
+                    "也可能是②波形已被滚动清理。这两种情况的处理方向不同，"
+                    "不要断言成'设备从来没上报过'。",
+                    device_id=did, state="empty",
+                    wave_retention=WAVE_RETENTION_NOTE)
+    rec = rows[0]
+    data = dict(rec)
+    data["posture_label"] = POSTURE_LABEL.get(rec.get("posture"), "未知")
+    # ★ 恒为 None。不是"没采到"，是**原理上测不到** —— 这个区别必须写在数据里。
+    data["yaw"] = None
+    data["yaw_note"] = YAW_NOTE
+    return _ok("GET /api/attitude", data, time=rec["received_at"], state="ok",
+               device_id=did,
+               yaw=None, yaw_note=YAW_NOTE, basis=ATTITUDE_BASIS,
+               time_semantics={
+                   "received_at": "服务端入库时刻（判定用）",
+                   "t_last": "板端采样时刻（板子自己报的，只作参考，服务端不采信）"},
+               assumed_device=chk.get("assumed", False))
+
+
+def t_query_waveform(conn, device_id=None, limit=None, since=None, **_):
+    """取最近 N 批波形的**摘要** —— 刻意**不吐原始样本**。
+
+    为什么不像 query_readings 那样把样本给出去：
+      · 一批 100 点 × 3 轴 = 300 个数，几批就上千，塞进上下文纯属浪费；
+      · 模型对原始样本做不了任何有用的事 —— 它不会去算 FFT，
+        反而容易"看着数字编趋势"。要趋势就该用摘要里的统计量。
+      · 结论：**能吐多少数据由我们定，不由模型定** —— 和第 4 周的 MAX_ROWS 同一个原则。
+    """
+    try:
+        n = _check_limit(limit)
+        since_iso = _parse_since(since)
+    except ValueError as e:
+        return _err("GET /api/waveform", str(e))
+    chk = _check_device(conn, device_id)
+    if not chk["ok"]:
+        return _err("GET /api/waveform", chk["error"],
+                    needs_clarification=chk.get("needs_clarification", False),
+                    candidates=chk.get("candidates", []), hint=chk.get("hint"))
+    did = chk["device_id"]
+    sql = ("SELECT id, device_id, boot_id, batch_seq, hz, n_samples, dropped, "
+           "received_at, t_first, t_last, ax, ay, az, acc_mag, pitch, roll, "
+           "posture, posture_note FROM wave_batches WHERE device_id=?")
+    params = [did]
+    if since_iso:
+        sql += " AND received_at >= ?"
+        params.append(since_iso)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(n)
+    rows = _run_readonly(conn, sql, tuple(params), max_rows=n)
+    if not rows:
+        return _err("GET /api/waveform",
+                    "该条件下没有波形批次。注意这与'设备不存在'是两回事；"
+                    "波形按最近 N 批滚动清理，也可能只是被清理掉了。",
+                    device_id=did, since=since_iso, state="empty",
+                    wave_retention=WAVE_RETENTION_NOTE)
+
+    rows = list(reversed(rows))          # 老的在前，与网页画波形的顺序一致
+    source, note = _wave_axis_source(rows)
+    postures = [r["posture"] for r in rows]
+    dropped_total = sum(int(r["dropped"] or 0) for r in rows)
+    latest = rows[-1]
+    detail = [{
+        "id": r["id"], "batch_seq": r["batch_seq"], "n_samples": r["n_samples"],
+        "hz": r["hz"], "dropped": int(r["dropped"] or 0),
+        "received_at": r["received_at"],
+        "t_first": r["t_first"], "t_last": r["t_last"],
+        "ax": r["ax"], "ay": r["ay"], "az": r["az"],
+        "acc_mag": r["acc_mag"], "pitch": r["pitch"], "roll": r["roll"],
+        "posture": r["posture"],
+        "posture_label": POSTURE_LABEL.get(r["posture"], "未知"),
+        "posture_note": r["posture_note"],
+    } for r in rows]
+    data = {
+        "batches": detail,
+        "summary": {
+            "batch_count": len(rows),
+            "sample_count": sum(r["n_samples"] for r in rows),
+            "hz": latest["hz"],
+            "posture_latest": latest["posture"],
+            "posture_latest_label": POSTURE_LABEL.get(latest["posture"], "未知"),
+            "posture_changed_in_window": len(set(postures)) > 1,
+            "dropped_total": dropped_total,
+            "acc_mag_latest": latest["acc_mag"],
+        },
+        "time_axis_source": source,
+        "time_axis_note": note,
+        "samples_omitted": True,
+        "samples_omitted_reason": "原始样本不交给模型：几批就上千个数，"
+                                  "模型用它算不出东西，反而容易编趋势。"
+                                  "要看波形请用网页上的示波器面板。",
+    }
+    return _ok("GET /api/waveform", data, time=latest["received_at"], state="ok",
+               device_id=did, limit_applied=n, since=since_iso,
+               yaw=None, yaw_note=YAW_NOTE, basis=ATTITUDE_BASIS,
+               dropped_note=("dropped_total 是板端**如实上报**的丢样本数（环形缓冲溢出所致）。"
+                             "非 0 时批间有洞，时间轴不能按采样率反推 —— "
+                             "这条比'一个点都没丢'和'丢了一些'混着说要紧得多。"),
+               wave_retention=WAVE_RETENTION_NOTE,
+               assumed_device=chk.get("assumed", False))
+
+
 def t_request_capture(conn, device_id=None, reason=None, **_):
     """请求开发板**现在**拍一张 —— 唯一的"写"工具，而且它只下指令、不写数据。
 
@@ -434,6 +666,9 @@ TOOLS = {
     "query_frames":        t_query_frames,
     "get_command_status":  t_get_command_status,
     "list_help_events":    t_list_help_events,
+    # ↓ 第 5 周数据（姿态/波形）—— 全是只读，不新增任何"写"能力
+    "get_attitude":        t_get_attitude,
+    "query_waveform":      t_query_waveform,
     "request_capture":     t_request_capture,
 }
 
@@ -486,6 +721,28 @@ TOOL_SPECS = [
         "parameters": {"type": "object", "properties": {
             "device_id": {"type": "string"},
             "limit": {"type": "integer"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_attitude",
+        "description": "读取某台设备**最新姿态**：posture（flat/upright/side_edge/tilted）、"
+                       "posture_label、acc_mag（合加速度）、pitch、roll。只读。"
+                       "★ 返回值里 yaw 恒为 null 且带 yaw_note —— "
+                       "本板无陀螺仪/磁力计，**航向在原理上不可测**，"
+                       "被问到朝向时必须如实说'不可测'并给原因，"
+                       "既不许留空装作没看见，也不许报 0° 或任何具体角度。",
+        "parameters": {"type": "object", "properties": {
+            "device_id": {"type": "string", "description": "设备编号；不确定时先调 list_devices"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "query_waveform",
+        "description": "读取某台设备最近几批**波形摘要**（批号、样本数、采样率、"
+                       "丢样本数 dropped、每批的姿态/合加速度/俯仰/横滚、"
+                       "以及时间轴用的是哪一档）。只读。"
+                       "★ 刻意**不返回原始样本** —— 要看波形本身请用网页示波器面板。",
+        "parameters": {"type": "object", "properties": {
+            "device_id": {"type": "string"},
+            "limit": {"type": "integer", "description": "取最近几批，上限 200"},
+            "since": {"type": "string", "description": "时间范围，如 10m / 2h / 3d"}},
             "required": []}}},
     {"type": "function", "function": {
         "name": "request_capture",
@@ -544,8 +801,9 @@ SYSTEM_PROMPT = """你是一台开发板数据服务的**运行时问答助手**
 你必须通过调用工具去查真实数据来回答。你没有别的事实来源。
 
 【铁律一：只读与请求，必须分清】
-  · 用户问"现在/刚才/最近的数值是多少""有哪些数据""拍过哪些照片" —— 这是**读取已有记录**，
-    调 get_latest_reading / query_readings / query_frames / list_help_events / list_devices。
+  · 用户问"现在/刚才/最近的数值是多少""有哪些数据""拍过哪些照片""板子什么姿态/怎么摆的"
+    —— 这是**读取已有记录**，调 get_latest_reading / query_readings / query_frames /
+    list_help_events / list_devices / get_attitude / query_waveform。
     读记录**不会**产生新采集。
   · 用户说"让板子现在拍一张""重新采集一次""再测一下" —— 这才是**请求一次新采集**，
     调 request_capture。不要用读取类工具去假装完成了采集。
@@ -573,6 +831,23 @@ SYSTEM_PROMPT = """你是一台开发板数据服务的**运行时问答助手**
   求助事件有三层状态：device_state 是**板子**说的，server_state 是**服务端**说的，
   viewer_state 是**人**说的。三者分别独立，绝不能由一层推断另一层。
   "服务端没收到"不等于"板子没发出来"；"没人回应"也不等于"人拒绝了"。
+
+【铁律六：姿态的能测与不能测，必须分开说】
+  · 姿态是**由重力方向**判出来的（加速度计静止时测的是支撑力，读数指向天空），
+    所以凡由倾斜决定的状态都测得到：平放 / 竖直 / 侧立 / 自由倾斜，
+    以及合加速度 |a|（静止时 ≈ 1.000 g）、俯仰 pitch、横滚 roll。
+  · ★ **航向（yaw / 朝向 / 东南西北）在原理上不可测** —— 本板没有陀螺仪和磁力计，
+    绕重力轴自转不改变重力方向，所以这个自由度从数据里根本不存在。
+    工具返回的 yaw 恒为 null，并带 yaw_note。
+    被问到航向时，必须**明确说"不可测"并给出原因**：
+      ✗ 不许留空、装没看见；
+      ✗ 不许报 0°、正北、或任何具体角度；
+      ✗ 不许用 pitch/roll 去凑一个"方向"糊弄过去；
+      ✓ 正确说法："俯仰 x°、横滚 y° 可测；航向不可测 —— 本板无陀螺仪/磁力计。"
+  · 姿态是**某一批数据的属性**，不是"设备永久的状态"：它随时会随摆放变化。
+    回答时要说清这是**哪一批/哪个时刻**的姿态，别把旧姿态说成"现在"。
+  · 波形属**过程数据**：服务端按最近 N 批滚动清理。
+    "查不到老波形"不等于"设备没上报过"—— 别把清理说成没数据。
 
 【表达要求】
   用中文回答，简短、直给。先说结论，再给来源/时间/状态。
@@ -667,6 +942,56 @@ def _claims_success(text):
     return False, ""
 
 
+# ---- 第 5 周：航向守卫 ----
+#
+# ★ 为什么"航向"要单独守一道，而不能只靠提示词：
+#   航向是**原理上测不到**的自由度（本板无陀螺仪/磁力计），不是"这次没采到"。
+#   模型面对"板子朝哪边"，最常见的两种糊弄在**数字上都不假**，却会让用户
+#   以为"方向是测得到的"：
+#     · 报 0° —— 看着最"中性"，可 0° 就是正北，等于凭空造了个方向；
+#     · 拿 pitch/roll 的数字顶上 —— 那两个角是相对重力的倾角，跟朝哪儿无关。
+#   所以这道守卫要拦的不是"说错数"，而是"把一个不可测的量说成测到了"。
+_YAW_WORDS = ("航向", "朝向", "yaw", "指北", "罗盘", "方位", "朝哪", "哪个方向")
+_YAW_DIRWORDS = ("正北", "正南", "正东", "正西", "朝北", "朝南", "朝东", "朝西",
+                 "向北", "向南", "向东", "向西", "北偏", "南偏",
+                 "东北方向", "西北方向", "东南方向", "西南方向")
+_YAW_DENY = ("不可测", "测不到", "测不出", "无法测", "不能测", "没法测",
+             "没有陀螺仪", "无陀螺仪", "没有磁力计", "无磁力计",
+             "无法确定", "不可知", "不适用", "未知", "null", "none")
+# 角度写法：`12°` / `12度` / `12 deg` / `-1.2°`
+_ANGLE_RE = re.compile(r"-?\d+(?:\.\d+)?\s*(?:°|度|deg\b)")
+
+
+def _asked_yaw(question: str) -> bool:
+    q = (question or "").lower()
+    return any(w in q for w in _YAW_WORDS) or any(w in q for w in _YAW_DIRWORDS)
+
+
+def _yaw_violation(text, question):
+    """有没有把"航向"当成一个能报出数的量。返回 (是否越界, 命中的句子)。"""
+    def denied(s):
+        low = s.lower()
+        return any(d in low for d in _YAW_DENY)
+
+    for sent in re.split(r"[。！？\n]", text or ""):
+        s = sent.strip()
+        if not s or denied(s):
+            continue                        # "航向不可测" 这种正确说法，放过
+        has_yaw = any(w in s.lower() for w in _YAW_WORDS)
+        has_dir = bool(_ANGLE_RE.search(s)) or any(w in s for w in _YAW_DIRWORDS)
+        if has_yaw and has_dir:
+            return True, s
+
+    # 用户问的**就是**航向，而整段回答里既没声明"不可测"、又在报角度或方向
+    # （典型：拿俯仰/横滚的数字顶上，让人以为那就是朝向）
+    if _asked_yaw(question) and not denied(text or ""):
+        for sent in re.split(r"[。！？\n]", text or ""):
+            s = sent.strip()
+            if _ANGLE_RE.search(s) or any(w in s for w in _YAW_DIRWORDS):
+                return True, s
+    return False, ""
+
+
 def _has_completion_evidence(trace) -> bool:
     """整轮对话里，有没有出现"采集确实完成"的硬证据。"""
     for t in trace:
@@ -727,6 +1052,16 @@ def guard_answer(answer: str, trace, question: str) -> dict:
             cands += (t.get("result") or {}).get("candidates") or []
         text += ("\n\n（系统提醒：设备不唯一，需要你确认要查哪一台。"
                  "候选：%s）" % ("、".join(sorted(set(cands))) or "无"))
+
+    # ④ 把一个**原理上不可测**的量（航向）说成测到了
+    bad_yaw, yaw_sent = _yaw_violation(text, question)
+    if bad_yaw:
+        flags.append("yaw_fabricated")
+        text = ("【更正】航向不可测，不能给出具体方向或角度。\n"
+                "本板无陀螺仪/磁力计 —— 绕重力轴自转不改变重力方向，"
+                "这个自由度从数据里根本不存在，不是这次没采到。\n"
+                "能测的只有俯仰、横滚和合加速度；用它们回答时要**明说**航向不可测。\n\n"
+                "（模型原话里这句话被拦下了：%s）" % yaw_sent) + "\n\n" + text
 
     return {"text": text, "guardrails": flags}
 
