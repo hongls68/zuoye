@@ -356,8 +356,11 @@ def t_query_frames(conn, device_id=None, limit=None, since=None, **_):
                     needs_clarification=chk.get("needs_clarification", False),
                     candidates=chk.get("candidates", []), hint=chk.get("hint"))
     did = chk["device_id"]
+    # ★ 加了新列就要同步到这里 —— 否则模型看不到"这帧是补传的"，
+    #   会把一张十几分钟前断网时拍的图说成"刚刚拍的"。见 §1.1 那张清单。
     sql = ("SELECT id, device_id, ts_server, capture_ts, filename, size_bytes, "
-           "width, height, source, request_id, boot_id, seq, sha256, purged_at "
+           "width, height, source, request_id, boot_id, seq, sha256, purged_at, "
+           "buffered_us, backlog_dropped "
            "FROM frames WHERE device_id=?")
     params = [did]
     if since_iso:
@@ -372,9 +375,17 @@ def t_query_frames(conn, device_id=None, limit=None, since=None, **_):
     for r in rows:
         # purged_at 有值 = 原图已被配额清理，但哈希还在 —— 元数据不随原图消失
         r["image_available"] = not r["purged_at"]
+        # ★ 补传帧：采集时刻在**过去**。这个标记必须跟着数据走，
+        #   否则模型会把断网期间攒下的图说成"刚刚拍的"。
+        r["is_backlog"] = (r.get("source") == "backlog")
+        r["buffered_s"] = (round(r["buffered_us"] / 1e6, 1)
+                           if r.get("buffered_us") is not None else None)
     return _ok("GET /api/frames", {"frames": rows, "count": len(rows)},
                time=rows[0]["ts_server"], state="ok", device_id=did,
                limit_applied=n, since=since_iso,
+               backlog_note=("is_backlog=true 的帧是**断网期间采集、恢复后补传**的："
+                             "capture_ts 在过去，ts_server 才是服务端收到它的时刻。"
+                             "回答时必须说清这一点，不能把它当成'刚拍的'。"),
                assumed_device=chk.get("assumed", False))
 
 
@@ -698,7 +709,9 @@ TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "query_frames",
         "description": "读取某台设备**已有的**图像帧元数据（含 SHA-256、拍摄时刻、原图是否已清理）。"
-                       "只读，不触发新拍摄。",
+                       "只读，不触发新拍摄。"
+                       "★ 注意 is_backlog=true 的帧是**断网期间采集、恢复后补传**的，"
+                       "它的 capture_ts 在过去 —— 不能当成'刚拍的'。",
         "parameters": {"type": "object", "properties": {
             "device_id": {"type": "string"},
             "limit": {"type": "integer"},
@@ -848,6 +861,18 @@ SYSTEM_PROMPT = """你是一台开发板数据服务的**运行时问答助手**
     回答时要说清这是**哪一批/哪个时刻**的姿态，别把旧姿态说成"现在"。
   · 波形属**过程数据**：服务端按最近 N 批滚动清理。
     "查不到老波形"不等于"设备没上报过"—— 别把清理说成没数据。
+
+【铁律七：补传的帧不等于"刚拍的"】
+  · `is_backlog=true` 的帧，是设备**断网期间采集、恢复联网后补传**上来的。
+    它的 `capture_ts`（采集时刻）在**过去**，可能比 `ts_server`（服务端收到时刻）
+    早很多；`buffered_s` 就是它在板端 Flash 队列里待了多久。
+  · 回答时必须说清"这是补传的，采集于 X，服务端 Y 时刻才收到"，
+    **不许**把它当成"刚拍的"来汇报。
+  · 补传帧**永远不会**是某次远程采集请求的结果（服务端在入口就拒掉了
+    "补传 + request_id"的组合）—— 所以看到 is_backlog 就不要去关联任何 request_id。
+  · `backlog_dropped` 大于 0 表示：存这一帧的时候，队列已经因为满了而丢掉了
+    更老的若干帧。这是"断网太久、Flash 装不下"的如实记录，要如实说出来，
+    不要含糊成"数据完整"。
 
 【表达要求】
   用中文回答，简短、直给。先说结论，再给来源/时间/状态。

@@ -150,6 +150,23 @@ SWEEP_INTERVAL_S = 5               # 后台过期扫描周期（秒）
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or 7)
 PURGE_INTERVAL_S = 300             # 后台清理扫描周期（秒）
 
+# ---- 第2周承诺的「断网 Flash 缓存」：补传帧怎么算 ----
+#
+# 计划书 4.2 把缓冲层列为**不是可选项**：「断网期间捕获帧自动驻留 Flash 待恢复上传」。
+# 补传帧和在线帧有一个**本质区别**：它的**采集时刻是过去的**。
+# 所以它必须是一个显式来源，不能混进 periodic —— 否则画廊里那张图看起来
+# 就像"刚刚拍的"，而实际上可能是十几分钟前断网时攒下来的。
+#
+# ★ 这与第 2 周的题眼是同一件事的两面：
+#   题眼问"怎样证明这是**新**采集"，补传问"怎样证明这**不是**新采集"。
+#   所以服务端有一条硬规则（见 _handle_frame）：
+#     **补传帧一律不许带 request_id** —— 带了就是拿旧帧冒充某次远程请求的观测。
+FRAME_SOURCE_BACKLOG = "backlog"
+FRAME_SOURCES = ("web_manual", "periodic", FRAME_SOURCE_BACKLOG, "unknown")
+# 在队列里待的时长上限（板端报的微秒值）。超过就说明板端钟错乱或队列坏了，
+# 这种值宁可标成不可信，也不要拿它算"待了多久"。
+BACKLOG_MAX_BUFFERED_S = 30 * 86400
+
 # 状态集合（与网页状态徽标一一对应，改这里要同步改 index.html）
 ST_PENDING   = "PENDING"    # 指令已创建，等待设备取走
 ST_RECEIVED  = "RECEIVED"   # 设备已取走并回执
@@ -338,7 +355,11 @@ def init_db() -> None:
                           ("size_bytes", "INTEGER"),# 原图字节数
                           ("width", "INTEGER"),     # 从 JPEG 头解析出的宽
                           ("height", "INTEGER"),    # 从 JPEG 头解析出的高
-                          ("source", "TEXT"),       # 来源：web_manual / periodic / unknown
+                          ("source", "TEXT"),       # 来源：web_manual / periodic / backlog
+                          # ↓ 断网补传（backlog）专用。两列都是**板端如实上报**的，
+                          #   服务端不采信（判定一律用 ts_server），只作展示与对账。
+                          ("buffered_us", "INTEGER"),     # 这一帧在 Flash 队列里待了多久
+                          ("backlog_dropped", "INTEGER"), # 存它时队列已因满而丢弃的更老帧数
                           ("purged_at", "TEXT")):   # 原图被清理的时刻（NULL=原图还在）
             if col not in frame_cols:
                 conn.execute(f"ALTER TABLE frames ADD COLUMN {col} {decl}")
@@ -1138,6 +1159,12 @@ class Handler(BaseHTTPRequestHandler):
           X-Boot-Id     本次开机标识（E3 新鲜度校验）
           X-Seq         开机内递增序号（E3 新鲜度校验）
         周期性抓拍不带 X-Request-Id，只入库、不参与命令闭环。
+
+        断网补传（计划书 4.2 承诺的 Flash 缓冲）再带三个头：
+          X-Source           "backlog" —— 显式声明这是补传，不是刚拍的
+          X-Buffered-Us      这一帧在 Flash 队列里待了多久（微秒，板端钟）
+          X-Backlog-Dropped  存它的时候，队列已因满而丢弃的更老帧数
+        ★ 补传帧**一律不许带 X-Request-Id**，理由见下面的硬规则。
         """
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1160,6 +1187,51 @@ class Handler(BaseHTTPRequestHandler):
             seq = int(self.headers.get("X-Seq") or "")
         except ValueError:
             seq = None
+        source = (self.headers.get("X-Source") or "").strip()
+
+        # ★★ 硬规则：补传帧不许绑到某次远程请求上。
+        #
+        # 【为什么必须显式拒绝，而不是"忽略 request_id 就好"】
+        #   忽略的话，板端会以为这次上传成功了（拿到 201），
+        #   而服务端悄悄丢掉绑定关系 —— 两边对同一件事的理解不一致。
+        #   第 2 周整周都在防"旧值冒充新采集"，这里正是那个漏洞的形状：
+        #   断网期间拍的帧，联网后补传，若被当成某次"现在拍一张"的观测，
+        #   三条证据里 E2（capture_ts 必须晚于 dispatched_at）本来就会拦下它，
+        #   但那是**靠事后校验兜**；能在入口直接拒，就不该让它进库。
+        #   而且这类帧一旦进库，画廊里会出现一张"看起来属于某次请求"的旧图。
+        if source == FRAME_SOURCE_BACKLOG and request_id:
+            self._send_json(
+                {"error": "补传帧不能绑定 request_id",
+                 "detail": "source=backlog 表示这一帧是断网期间采集、恢复后补传的，"
+                           "它的采集时刻在**过去**。把它当成某次远程请求的观测，"
+                           "就是第 2 周题眼里那个『旧值冒充新采集』。",
+                 "hint": "补传请只带 X-Source: backlog；命令触发的帧请不带 backlog 标记。"},
+                400)
+            return
+
+        buffered_us = None
+        backlog_dropped = None
+        if source == FRAME_SOURCE_BACKLOG:
+            try:
+                buffered_us = int(self.headers.get("X-Buffered-Us") or "")
+            except ValueError:
+                buffered_us = None
+            try:
+                backlog_dropped = int(self.headers.get("X-Backlog-Dropped") or "")
+            except ValueError:
+                backlog_dropped = None
+            # 负值/超上限一律归 None：宁可标成"这个值不可信"，
+            # 也不要拿一个错的值去算"在队列里待了多久"。
+            if buffered_us is not None and not (
+                    0 <= buffered_us <= BACKLOG_MAX_BUFFERED_S * 1_000_000):
+                buffered_us = None
+            if backlog_dropped is not None and backlog_dropped < 0:
+                backlog_dropped = None
+        elif source and source not in FRAME_SOURCES:
+            # 未知来源不拒收（别让一个新板端把链路卡死），但落库时归成 unknown，
+            # 免得画廊里出现一个前端不认识的徽标。
+            source = "unknown"
+
         ts = now_iso()
         try:
             fname = save_frame(data, ts)
@@ -1169,7 +1241,6 @@ class Handler(BaseHTTPRequestHandler):
         # 画廊要用的派生信息：哈希（永久留痕）、字节数、分辨率、来源。
         digest = sha256_hex(data)
         width, height = jpeg_size(data)
-        source = (self.headers.get("X-Source") or "").strip()
         if not source:
             # 没显式声明就按有无 request_id 推断：带 request_id 一定是网页点出来的。
             source = "web_manual" if request_id else "periodic"
@@ -1179,28 +1250,43 @@ class Handler(BaseHTTPRequestHandler):
                 cur = conn.execute(
                     "INSERT INTO frames(device_id, ts_server, filename, bytes, "
                     "request_id, capture_ts, boot_id, seq, ts_device, "
-                    "sha256, size_bytes, width, height, source) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "sha256, size_bytes, width, height, source, "
+                    "buffered_us, backlog_dropped) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (device_id or None, ts, fname, len(data),
                      request_id or None, capture_ts or None,
                      boot_id or None, seq, ts_device or None,
-                     digest, len(data), width, height, source),
+                     digest, len(data), width, height, source,
+                     buffered_us, backlog_dropped),
                 )
                 conn.commit()
                 frame_id = cur.lastrowid
             finally:
                 conn.close()
 
-        # 命令触发的帧：立刻走证据校验，决定是 UPLOADED 还是 COMPLETED / FAILED
+        # 命令触发的帧：立刻走证据校验，决定是 UPLOADED 还是 COMPLETED / FAILED。
+        # ★ 补传帧到不了这里 —— 上面已经拒掉了"backlog + request_id"的组合，
+        #   所以补传帧的 request_id 必为空，天然不参与命令闭环。
         verdict = None
         if request_id:
             verdict = self._link_command_frame(request_id, frame_id)
 
-        self._send_json({"ok": True, "bytes": len(data),
-                         "device_id": device_id, "ts_server": ts,
-                         "sha256": digest, "width": width, "height": height,
-                         "request_id": request_id or None,
-                         "evidence": verdict}, 201)
+        resp = {"ok": True, "bytes": len(data),
+                "device_id": device_id, "ts_server": ts,
+                "sha256": digest, "width": width, "height": height,
+                "source": source,
+                "request_id": request_id or None,
+                "evidence": verdict}
+        if source == FRAME_SOURCE_BACKLOG:
+            resp["backlog"] = {
+                "buffered_us": buffered_us,
+                "buffered_s": (round(buffered_us / 1e6, 1)
+                               if buffered_us is not None else None),
+                "dropped_before": backlog_dropped,
+                "note": "已按补传入库：capture_ts 是**过去**的采集时刻，"
+                        "ts_server 才是服务端收到它的时刻。这一帧不参与任何命令闭环。",
+            }
+        self._send_json(resp, 201)
 
     def _link_command_frame(self, request_id: str, frame_id: int):
         """把刚入库的这一帧关联到指令上，并做三条证据校验。
@@ -1272,6 +1358,8 @@ class Handler(BaseHTTPRequestHandler):
             args.append(limit)
             items = []
             for r in conn.execute(sql, args).fetchall():
+                src = r["source"] or "unknown"
+                buffered_us = r["buffered_us"]
                 items.append({
                     "id": r["id"],
                     "device_id": r["device_id"],
@@ -1279,20 +1367,34 @@ class Handler(BaseHTTPRequestHandler):
                     "capture_ts": r["capture_ts"],
                     "request_id": r["request_id"],
                     "command_state": r["command_state"],
-                    "source": r["source"] or "unknown",
+                    "source": src,
                     "bytes": r["size_bytes"] if r["size_bytes"] is not None else r["bytes"],
                     "width": r["width"] or 0,
                     "height": r["height"] or 0,
                     "sha256": r["sha256"],
                     "purged": bool(r["purged_at"]),
                     "purged_at": r["purged_at"],
+                    # ---- 断网补传（backlog）----
+                    # ★ 这三个字段必须一起给出去，缺一个就会让人把补传帧当成新拍的：
+                    #   is_backlog       —— 它是补传的（前端据此打徽章）
+                    #   buffered_s       —— 在队列里待了多久（板端钟，只作参考）
+                    #   backlog_dropped  —— 存它之前队列已丢了多少更老的帧
+                    "is_backlog": src == FRAME_SOURCE_BACKLOG,
+                    "buffered_us": buffered_us,
+                    "buffered_s": (round(buffered_us / 1e6, 1)
+                                   if buffered_us is not None else None),
+                    "backlog_dropped": r["backlog_dropped"],
                 })
             stat = conn.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN purged_at IS NULL THEN 1 ELSE 0 END) AS kept, "
                 "SUM(CASE WHEN purged_at IS NULL "
-                "         THEN COALESCE(size_bytes, bytes, 0) ELSE 0 END) AS kept_bytes "
-                "FROM frames"
+                "         THEN COALESCE(size_bytes, bytes, 0) ELSE 0 END) AS kept_bytes, "
+                "SUM(CASE WHEN source=? THEN 1 ELSE 0 END) AS backlog, "
+                "SUM(CASE WHEN source=? THEN COALESCE(backlog_dropped, 0) ELSE 0 END) "
+                "  AS backlog_dropped "
+                "FROM frames",
+                (FRAME_SOURCE_BACKLOG, FRAME_SOURCE_BACKLOG)
             ).fetchone()
             total = stat["total"] or 0
             kept = stat["kept"] or 0
@@ -1300,8 +1402,15 @@ class Handler(BaseHTTPRequestHandler):
                 "frames": items,
                 "storage": {"total": total, "kept": kept, "purged": total - kept,
                             "kept_bytes": stat["kept_bytes"] or 0,
-                            "retention_days": RETENTION_DAYS},
+                            "retention_days": RETENTION_DAYS,
+                            # 补传帧单独计数 —— 它是"断网期间没丢"的证据，
+                            # 也是"设备到底断网多久"的旁证，不该混在总数里看不出来。
+                            "backlog_frames": stat["backlog"] or 0,
+                            "backlog_dropped_total": stat["backlog_dropped"] or 0},
                 "server_now": now_iso(),
+                "backlog_note": "source=backlog 的帧是**断网期间采集、恢复后补传**的："
+                                "它的 capture_ts 在过去，ts_server 才是服务端收到它的时刻。"
+                                "补传帧不参与任何命令闭环（不允许带 request_id）。",
             })
         finally:
             conn.close()

@@ -4,3 +4,10 @@
 nvs,          data, nvs,     0x9000,   0x6000,
 phy_init,     data, phy,     0xf000,   0x1000,
 factory,      app,  factory, 0x10000,  0x300000,
+# 断网 Flash 缓存（计划书 4.2 的缓冲层）：断网期间抓到的帧先驻留在这里，恢复后补传。
+# ★ 放在 factory 之后，**不动前面任何一个分区的偏移** —— 这样改分区表不会
+#   影响已有的 NVS 数据（Wi-Fi 凭据、boot_cnt），刷机不用重新配网。
+# 3MB 是按 800×600 JPEG 单帧约 40~70KB 估的，能存 40~70 帧；
+# 断网时抓帧间隔放宽到 BACKLOG_OFFLINE_PERIOD_MS（默认 10s），
+# 也就是能覆盖 7~12 分钟的断网。装满后丢最老的一帧并如实计数上报。
+backlog,      data, spiffs,  0x310000, 0x300000,

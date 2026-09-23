@@ -441,10 +441,18 @@
       <span>已按配额清理 <b id="galPurged">0</b></span>
       <span>占用 <b id="galBytes">0 KB</b></span>
       <span>保留期 <b id="galRetention">--</b> 天</span>
+      <span>其中断网补传 <b id="galBacklog">0</b></span>
+      <span>补传期间丢弃 <b id="galBacklogDropped">0</b></span>
       <span class="code">GET /api/frames</span>
     </div>
     <div class="gal" id="galGrid"><div class="code">加载中…</div></div>
-    <div class="camnote">已清理的帧仍会留在列表里，带着 SHA-256 与拍摄时间 —— 图片可以过期，证据不过期。点击缩略图可放大原图。</div>
+    <div class="camnote">
+      已清理的帧仍会留在列表里，带着 SHA-256 与拍摄时间 —— 图片可以过期，证据不过期。点击缩略图可放大原图。<br>
+      ★ 带「<b>断网补传</b>」徽章的帧是设备**断网期间采集、恢复联网后补传**上来的：
+      它的<b>采集时刻在过去</b>，服务端是稍后才收到的，所以卡片上把三个时间分开写 ——
+      板端采集时刻（板子的钟，只作参考）/ 在队列里待了多久 / 服务端收到时刻（判定用它）。
+      <b>「补传」和「刚拍的」是两件事</b>，混在一起看就会把旧图当成新采集。
+    </div>
   </section>
 
   <div class="lightbox" id="lightbox">
@@ -724,7 +732,31 @@
   function srcBadge(s) {
     if (s === 'web_manual') return '<span class="badge info">网页指令</span>';
     if (s === 'periodic') return '<span class="badge">周期抓拍</span>';
+    // ★ 补传必须有自己的徽章，不能混进"周期抓拍"。
+    //   两者的区别不是"哪个接口传的"，而是**采集时刻是不是过去** ——
+    //   这正是第 2 周题眼（证明这是新采集）的反面：证明这不是新采集。
+    if (s === 'backlog') return '<span class="badge warn">断网补传</span>';
     return '<span class="badge">来源未知</span>';
+  }
+
+  // 补传帧的三个时间必须分开写清楚，缺一个就会让人把旧图当成刚拍的。
+  function backlogRows(f) {
+    if (!f.is_backlog) {
+      return '<div class="row"><span>拍摄时间</span><span>' +
+             esc(f.capture_ts || f.ts_server) + '</span></div>';
+    }
+    var waited = (f.buffered_s === null || f.buffered_s === undefined)
+      ? '未知（板端未报）'
+      : (f.buffered_s + ' 秒');
+    var dropped = (f.backlog_dropped > 0)
+      ? '<div class="row"><span>更老的帧</span><span class="code">已丢弃 ' +
+        f.backlog_dropped + ' 帧（队列满）</span></div>'
+      : '';
+    return '<div class="row"><span>采集时刻</span><span class="code">' +
+             esc(f.capture_ts || '—') + '<br>（板端钟，只作参考）</span></div>' +
+           '<div class="row"><span>队列中待了</span><span>' + waited + '</span></div>' +
+           '<div class="row"><span>服务端收到</span><span class="code">' +
+             esc(f.ts_server) + '<br>（判定用它）</span></div>' + dropped;
   }
 
   function stBadge(f) {
@@ -741,6 +773,10 @@
     el('galPurged').textContent = st.purged || 0;
     el('galBytes').textContent = fmtBytes(st.kept_bytes);
     el('galRetention').textContent = (st.retention_days === undefined ? '--' : st.retention_days);
+    // 补传帧单独计数：它是"断网期间没丢"的证据，也是"设备断了多久"的旁证，
+    // 混在总数里就看不出来了。
+    el('galBacklog').textContent = st.backlog_frames || 0;
+    el('galBacklogDropped').textContent = st.backlog_dropped_total || 0;
 
     var grid = el('galGrid');
     var list = data.frames || [];
@@ -762,7 +798,7 @@
           '<div class="row"><span>帧号</span><span>#' + f.id + '</span></div>' +
           '<div class="row"><span>分辨率</span><span>' + res + '</span></div>' +
           '<div class="row"><span>大小</span><span>' + fmtBytes(f.bytes) + '</span></div>' +
-          '<div class="row"><span>拍摄时间</span><span>' + (f.capture_ts || f.ts_server) + '</span></div>' +
+          backlogRows(f) +
           (f.request_id
             ? '<div class="row"><span>请求</span><span class="code">' + f.request_id + '</span></div>'
             : '') +

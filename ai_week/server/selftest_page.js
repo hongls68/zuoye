@@ -297,6 +297,63 @@ W.drawWave({ series: flat });
 check('纵轴有 ±1.2g 下限，静止数据不会被噪声放大',
   c3.calls.fillText > 0 && c3.calls.lineTo > 0, c3.calls.lineTo);
 
+// ---------- 7. 断网补传：画廊里的补传帧不能长得像"刚拍的" ----------
+//
+// 这一组守的是一个**很容易看起来没问题**的错误：
+// 补传帧和在线帧长得一模一样，只在 source 上差一个词。
+// 如果不打徽章、不把三个时间分开写，看画廊的人就会把断网期间攒的旧图
+// 当成"刚刚拍的"—— 那正是第 2 周题眼要防的"旧值冒充新采集"。
+console.log('\n== 7. 断网补传：画廊徽章与三个时间 ==');
+const startG = src.indexOf('var GAL_MS =');
+const endG = src.indexOf('function refreshGallery(');
+if (startG < 0 || endG < 0) { check('能抽出画廊渲染函数', false); }
+const renderGallery = new Function('el',
+  escSrc + '\n' + src.slice(startG, endG) + '\n return renderGallery;')(el);
+
+const galFrames = [
+  { id: 11, device_id: 's3eye-group01', ts_server: '2026-09-23T10:00:00.000+08:00',
+    capture_ts: '2026-09-23T10:00:00.000+08:00', request_id: null,
+    command_state: null, source: 'periodic', bytes: 40000, width: 800, height: 600,
+    sha256: 'a'.repeat(64), purged: false, is_backlog: false },
+  { id: 12, device_id: 's3eye-group01', ts_server: '2026-09-23T10:12:30.000+08:00',
+    capture_ts: 'uptime+12.345s(time_not_synced)', request_id: null,
+    command_state: null, source: 'backlog', bytes: 42000, width: 800, height: 600,
+    sha256: 'b'.repeat(64), purged: false, is_backlog: true,
+    buffered_us: 615000000, buffered_s: 615.0, backlog_dropped: 3 }
+];
+
+renderGallery({ frames: galFrames, storage: {
+  total: 2, kept: 2, purged: 0, kept_bytes: 82000, retention_days: 7,
+  backlog_frames: 1, backlog_dropped_total: 3 } });
+const outG = els.galGrid.innerHTML;
+
+check('补传帧有自己的徽章（不是"周期抓拍"）', outG.includes('断网补传'));
+check('在线帧仍然是"周期抓拍"', outG.includes('周期抓拍'));
+check('★ 补传帧把三个时间分开写：采集时刻 / 队列中待了 / 服务端收到',
+  outG.includes('采集时刻') && outG.includes('队列中待了')
+  && outG.includes('服务端收到'));
+check('★ 并注明"采集时刻"是板端钟、只作参考',
+  outG.includes('板端钟，只作参考'));
+check('★ 并注明"服务端收到"才是判定用的时刻',
+  outG.includes('判定用它'));
+check('队列中待了多久按秒显示', outG.includes('615 秒'));
+check('板端未对时的时间戳原文保留（不被吞掉）',
+  outG.includes('time_not_synced'));
+check('★ 丢弃过的更老帧数如实显示（不假装数据完整）',
+  outG.includes('已丢弃 3 帧'));
+check('在线帧不显示补传那三行',
+  (outG.match(/队列中待了/g) || []).length === 1);
+check('补传帧数写进了页面统计', els.galBacklog.textContent === 1);
+check('补传期间丢弃总数写进了页面统计', els.galBacklogDropped.textContent === 3);
+check('没有 undefined 漏出来', !/undefined/.test(outG));
+
+// 板端没报 buffered_us 时，不能显示成 null/NaN
+renderGallery({ frames: [Object.assign({}, galFrames[1],
+  { buffered_us: null, buffered_s: null })], storage: { total: 1, kept: 1 } });
+check('板端没报在队列里待多久时，显示"未知"而不是 null',
+  els.galGrid.innerHTML.includes('未知') && !/null/.test(els.galGrid.innerHTML),
+  els.galGrid.innerHTML.match(/队列中待了[\s\S]{0,40}/));
+
 console.log('\n' + '='.repeat(60));
 console.log('结果：' + (fails.length ? '失败 ' + fails.length + ' 项：' + fails.join('、')
                                    : '全部通过'));

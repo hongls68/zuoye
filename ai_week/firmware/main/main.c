@@ -27,6 +27,7 @@
 
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -45,6 +46,7 @@
 #include "camera.h"
 #include "help_btn.h"
 #include "wave.h"
+#include "backlog.h"
 
 static const char *TAG = "app";
 
@@ -63,6 +65,10 @@ static bool s_camera_ok = false;   /* 摄像头是否初始化成功（失败则
  */
 static char s_boot_id[24] = {0};
 static uint32_t s_seq = 0;
+/* 开机计数（NVS 里单调递增）。第 2 周起用它拼 boot_id；
+ * 断网缓存（backlog）也用它当队列文件名的第一段排序键 ——
+ * 重启后 uptime 会归零，只有它能把"重启前攒的帧"排在前面。 */
+static uint32_t s_boot_cnt = 0;
 
 /* ---------------- Wi-Fi ---------------- */
 
@@ -389,12 +395,33 @@ static esp_err_t upload_reading(const qma7981_sample_t *s,
  *   X-Request-Id  本次所属请求 —— 只有命令触发的帧才带；
  *                 周期性抓拍不带它，服务器那边就只入库、不参与命令闭环。
  *
+ * 断网补传（计划书 4.2）再多带三个头：
+ *   X-Source          "backlog" —— 显式声明这是补传，不是刚拍的
+ *   X-Buffered-Us     这一帧在 Flash 队列里待了多久（微秒）
+ *   X-Backlog-Dropped 存它的时候，队列已因满而丢弃的更老帧数
+ *   ★ 补传帧**绝不能带 X-Request-Id** —— 服务端会直接 400 拒收。
+ *     拿一张断网时拍的旧图去当某次远程请求的观测，就是第 2 周防的"旧值冒充"。
+ *
+ * 【为什么把参数收成一个结构体】
+ *   原来只有 request_id 一个可选参数，现在多了三个，再加下去
+ *   调用处会出现 `upload_frame(buf, len, ts, ts, NULL, "backlog", -1, -1)`
+ *   这种"数位置"的代码 —— 多一个参数就有一个传错的机会。
+ *   结构体里字段有名字，传错会编译报错（类型不同）或一眼看出来。
+ *
  * 失败不致命：下一帧会重试，不阻塞加速度上传。
  */
+typedef struct {
+    const char *request_id;       /* 命令触发时带；周期抓拍与补传都不带 */
+    const char *source;           /* NULL=由服务端按有无 request_id 推断 */
+    int64_t     buffered_us;      /* 补传：在队列里待了多久；<0 表示不适用 */
+    int32_t     backlog_dropped;  /* 补传：存它时已丢了多少更老的帧；<0 不适用 */
+} frame_meta_t;
+
 static esp_err_t upload_frame(const uint8_t *buf, size_t len,
                               const char *ts_device, const char *capture_ts,
-                              const char *request_id)
+                              const frame_meta_t *meta)
 {
+    const char *request_id = meta ? meta->request_id : NULL;
     char url[192];
     snprintf(url, sizeof(url), "%s/api/frame", SERVER_URL);
 
@@ -428,6 +455,19 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
     esp_http_client_set_header(client, "X-Seq", seq_buf);
     if (request_id && request_id[0]) {
         esp_http_client_set_header(client, "X-Request-Id", request_id);
+    }
+    if (meta && meta->source && meta->source[0]) {
+        esp_http_client_set_header(client, "X-Source", meta->source);
+    }
+    if (meta && meta->buffered_us >= 0) {
+        char buf_us[32];
+        snprintf(buf_us, sizeof(buf_us), "%lld", (long long)meta->buffered_us);
+        esp_http_client_set_header(client, "X-Buffered-Us", buf_us);
+    }
+    if (meta && meta->backlog_dropped >= 0) {
+        char buf_d[16];
+        snprintf(buf_d, sizeof(buf_d), "%ld", (long)meta->backlog_dropped);
+        esp_http_client_set_header(client, "X-Backlog-Dropped", buf_d);
     }
 
     /*
@@ -635,6 +675,7 @@ static void boot_id_init(void)
         nvs_commit(h);
         nvs_close(h);
     }
+    s_boot_cnt = count;                 /* 断网缓存也要用它，见 s_boot_cnt 的注释 */
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_boot_id, sizeof(s_boot_id), "%02x%02x%02x-boot%lu",
@@ -808,13 +849,242 @@ static void handle_remote_command(void)
     make_device_timestamp(capture_ts, sizeof(capture_ts));
     ESP_LOGI(TAG, "指令 %s 抓取一帧 %u bytes，带 request_id 回传", request_id,
              (unsigned int)fb->len);
-    upload_frame(fb->buf, fb->len, capture_ts, capture_ts, request_id);
+    /*
+     * ★ source 明确写 "web_manual"，**不能**写 "backlog"。
+     *   写错了服务端会 400 拒收（补传帧不许绑 request_id，见 upload_frame 注释）。
+     *   buffered_us / backlog_dropped 传 -1 表示"不适用"—— 这一帧刚拍完就发，
+     *   没有"在队列里待了多久"这回事，不能填 0（0 也是"待了 0 微秒"，但语义不同）。
+     */
+    const frame_meta_t meta = {
+        .request_id      = request_id,
+        .source          = "web_manual",
+        .buffered_us     = -1,
+        .backlog_dropped = -1,
+    };
+    upload_frame(fb->buf, fb->len, capture_ts, capture_ts, &meta);
     esp_camera_fb_return(fb);
 #else
     ESP_LOGE(TAG, "指令 %s 无法执行：固件编译时未启用摄像头", request_id);
     command_ack(request_id, "FAILED", "camera disabled in build");
 #endif
 }
+
+/* ================= 断网补传（计划书 4.2）=================
+ *
+ * 【为什么必须有这个 —— 原来这里是漏的】
+ *   断网时主循环直接 `continue` 跳过整个循环体，**连帧都不抓**。
+ *   网络恢复之后那段时间就是一片空白，谁也补不回来。
+ *   可是摄像头抓帧根本不需要网络 —— 白白浪费了设备本来就有的能力。
+ *   计划书把这一条标成"不是可选项"，因为"设备一脱网数据就丢"
+ *   和"这是一个无人值守的采集终端"这个前提是矛盾的。
+ *
+ * 【补传帧和"刚拍的帧"差在哪 —— 这是整个功能的题眼】
+ *   差的是**采集时刻**。补传帧的采集时刻在过去，可能是几分钟以前。
+ *   所以三件事必须做全：
+ *     ① 带 X-Source: backlog        —— 显式声明，不靠服务端猜
+ *     ② 带 X-Capture-Ts = 采集时刻  —— 不是上传时刻（服务端靠它算"在队列里待了多久"）
+ *     ③ **不带 X-Request-Id**        —— 服务端会 400 拒收，理由见 upload_frame 注释
+ *   缺任何一条，画廊里就会出现"看起来属于某次请求的旧图"，
+ *   也就是第 2 周整周在防的那个"旧值冒充新采集"。
+ *
+ * 【补传帧还带一个 X-Buffered-Us，而不是让服务端自己算】
+ *   服务端当然可以拿 (ts_server - capture_ts) 算，但那依赖板钟走得准。
+ *   板钟在对时之前是 1970 年，对时之后也可能偏 —— 而这个差值
+ *   （在队列里待了多久）板端用**同一个单调钟**相减就能精确得到，
+ *   不受板钟准不准影响。能算准的一方来算，算不准的一方别猜。
+ */
+#if CAMERA_ENABLE
+
+/* 上一次"断网抓帧入队"的板端时刻。初值取负一个周期 → 第一次判定立刻通过，
+ * 即断网后马上抓一帧（断网窗口可能很短，别等到第一个周期才动手）。 */
+static int64_t s_last_offline_cam_us =
+    -((int64_t)BACKLOG_OFFLINE_PERIOD_MS * 1000);
+
+/* 补传用的读缓冲：惰性申请一次，之后一直复用。
+ * 刻意不用 esp_camera_fb_get() 去借缓冲 —— 那个函数会**真的再抓一帧**。
+ * 补传一张旧图却顺手拍一张新图，既浪费又打乱周期抓拍的节奏。 */
+static uint8_t *s_replay_buf = NULL;
+
+static uint8_t *replay_buf_get(void)
+{
+    if (s_replay_buf != NULL) {
+        return s_replay_buf;
+    }
+    s_replay_buf = (uint8_t *)heap_caps_malloc(BACKLOG_MAX_FRAME_BYTES,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_replay_buf == NULL) {
+        /* 申请不到就如实说，不要静默降级成"补传悄悄不工作了" */
+        ESP_LOGE(TAG, "补传读缓冲申请失败（%d 字节），补传无法进行",
+                 (int)BACKLOG_MAX_FRAME_BYTES);
+    }
+    return s_replay_buf;
+}
+
+/* 把队列里的一帧补传出去。
+ *   capture_uptime_s  该帧采集时刻的板端 uptime（秒）
+ *   now_us            当前板端 uptime（微秒） */
+static esp_err_t upload_backlog_frame(const uint8_t *buf, size_t len,
+                                      int64_t capture_uptime_s, int64_t now_us)
+{
+    /*
+     * "在队列里待了多久" = 现在 - 采集时。
+     * 两个时刻都取自同一个单调钟（esp_timer），所以这个差值就是真实经过的时间，
+     * 板钟准不准都不影响它 —— 跟波形时间轴用的是同一套道理。
+     */
+    int64_t buffered_us = now_us - capture_uptime_s * 1000000;
+    if (buffered_us < 0) {
+        buffered_us = 0;            /* 时钟回绕时夹到 0，不倒着走 */
+    }
+
+    /*
+     * 采集时刻按"距现在 buffered_us 微秒之前"还原：
+     *   已对时 → 真实的 ISO 时刻（且是**过去**的时刻，这正是它该有的样子）
+     *   未对时 → uptime+<秒数>s(time_not_synced)
+     * 所以即使整段断网期间都没对时，这帧"是多久以前拍的"也没有丢。
+     */
+    char capture_ts[48];
+    make_timestamp_ago(buffered_us, capture_ts, sizeof(capture_ts));
+
+    char ts_device[48];
+    make_device_timestamp(ts_device, sizeof(ts_device));
+
+    const frame_meta_t meta = {
+        .request_id      = NULL,    /* ★ 补传帧绝不能绑 request_id */
+        .source          = "backlog",
+        .buffered_us     = buffered_us,
+        .backlog_dropped = (int32_t)backlog_dropped_total(),
+    };
+    return upload_frame(buf, len, ts_device, capture_ts, &meta);
+}
+
+/* 断网期间：按 BACKLOG_OFFLINE_PERIOD_MS 的节奏抓帧并存入 Flash 队列。
+ *
+ * 【为什么离线抓帧要降频】
+ *   分区 3MB，800×600 的 JPEG 一帧约 40~80KB（估），装得下 35~70 帧
+ *   （条数软上限 BACKLOG_MAX_FRAMES=64，空间先到就先卡住）。
+ *   沿用在线时的 2 秒间隔，一两分钟就把队列写满、之后全被丢掉 ——
+ *   结果是"断网 5 分钟只留下最后 2 分钟"，覆盖窗口反而更短。
+ *   放宽到 10 秒，换来约 6~11 分钟的覆盖窗口。
+ *   这是**有意的取舍**：宁可时间上稀一点，也不要覆盖窗口短到没意义。
+ *   真需要高密度就该换更大的分区，而不是把间隔调小。
+ *   ★ 上面这个窗口是按估算算的，真机上要实测一帧实际多大再复核。 */
+static void backlog_capture_if_due(int64_t now_us)
+{
+    if (!s_camera_ok) {
+        return;
+    }
+    if (now_us - s_last_offline_cam_us <
+        (int64_t)BACKLOG_OFFLINE_PERIOD_MS * 1000) {
+        return;
+    }
+    s_last_offline_cam_us = now_us;
+
+    if (!backlog_ready()) {
+        ESP_LOGW(TAG, "断网中，但 Flash 队列不可用 —— 本帧只能丢弃（如实记录，不假装存下了）");
+        return;
+    }
+
+    camera_fb_t *fb = camera_capture();
+    if (fb == NULL) {
+        ESP_LOGW(TAG, "断网中，抓帧失败，本帧丢弃");
+        return;
+    }
+
+    /*
+     * 采集时刻用**板端 uptime 的秒数**，不是对时后的墙上时间 ——
+     * 断网时 SNTP 必然失败，此刻根本没有可信的墙上时间。
+     * uptime 是单调钟，联网后拿 (那时的 uptime - 这时的 uptime) 反推
+     * "这一帧是多久以前拍的"，再套上对时后的当前时刻就还原出真实时刻。
+     * 这就是为什么采集时刻要写进队列文件名。
+     */
+    int64_t capture_uptime_s = now_us / 1000000;
+    esp_err_t err = backlog_put(fb->buf, fb->len, s_boot_cnt, capture_uptime_s);
+    esp_camera_fb_return(fb);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "断网中：已缓存一帧到 Flash（队列 %d 帧，累计丢弃 %lu 帧）",
+                 backlog_count(), (unsigned long)backlog_dropped_total());
+    } else {
+        ESP_LOGW(TAG, "断网中：缓存失败 %s（累计丢弃 %lu 帧）",
+                 esp_err_to_name(err), (unsigned long)backlog_dropped_total());
+    }
+}
+
+/* 联网后：把 Flash 队列里最老的几帧补传出去（先进先出）。
+ * 返回本次成功送达的帧数。
+ *
+ * 【为什么每轮只传 1 帧（BACKLOG_REPLAY_PER_LOOP 默认 1）】
+ *   每传一帧都要一次完整 HTTP 往返，本机这条链路抖动到 770ms。
+ *   一轮里塞满补传，周期上报和命令轮询就被挤没了 ——
+ *   而"暂停周期上报后命令通道仍能出新数据"是课程明确的检查项，
+ *   为了补传把它挤挂是本末倒置。
+ *   分开传的代价只是清空队列慢一点：离线按 10 秒攒、联网按 ~2 秒一轮清，
+ *   清空速度本来就是积攒速度的 5 倍左右，队列不会越积越多。
+ *
+ * 【和在线抓帧的关系】
+ *   补传不清空完也照常抓新帧 —— 两条流在画廊里是分开标注的
+ *   （补传帧有「断网补传」徽标和三个时间），所以时间上交错出现
+ *   不会被误读成"板子时间乱了"。 */
+static int backlog_replay(int max_frames)
+{
+    if (!backlog_ready()) {
+        return 0;
+    }
+    int sent = 0;
+    for (int i = 0; i < max_frames; i++) {
+        int queued = backlog_count();
+        if (queued <= 0) {
+            break;
+        }
+        uint8_t *buf = replay_buf_get();
+        if (buf == NULL) {
+            break;
+        }
+
+        size_t len = 0;
+        int64_t capture_uptime_s = 0;
+        char name[64];
+        esp_err_t err = backlog_peek_oldest(buf, BACKLOG_MAX_FRAME_BYTES, &len,
+                                            &capture_uptime_s, name, sizeof(name));
+        if (err != ESP_OK) {
+            /* 队列空、或队首是个坏条目（backlog.c 内部会把它删掉）。
+             * 不在这里重试 —— 下一轮循环自然会重新取队首。 */
+            ESP_LOGW(TAG, "取队首缓存帧失败: %s（队列 %d 帧）",
+                     esp_err_to_name(err), queued);
+            break;
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        int64_t buffered_s = (now_us - capture_uptime_s * 1000000) / 1000000;
+        if (buffered_s < 0) {
+            buffered_s = 0;
+        }
+        ESP_LOGI(TAG, "补传缓存帧 %s（%u bytes，采集于 %lld 秒前，队列还剩 %d 帧）",
+                 name, (unsigned int)len, (long long)buffered_s, queued);
+
+        if (upload_backlog_frame(buf, len, capture_uptime_s, now_us) != ESP_OK) {
+            /* ★ 失败就不删。留着下一轮再试 ——
+             *   先删后传的话，传失败这一帧就凭空没了，
+             *   而 dropped 计数还是 0，服务端会以为数据是完整的。
+             *   这比丢帧本身更糟：它把"丢过数据"这个事实也一起丢了。 */
+            ESP_LOGW(TAG, "补传失败，该帧留在队列里等下一轮重试");
+            break;
+        }
+        /* 只有真的送达了才删。 */
+        backlog_drop_oldest();
+        sent++;
+    }
+    return sent;
+}
+
+#else  /* !CAMERA_ENABLE */
+
+/* 没启用摄像头就没有帧可缓存。明确写成空函数，
+ * 调用处不用再套一层 #if —— 少一处条件，就少一处将来改配置时忘改的地方。 */
+static void backlog_capture_if_due(int64_t now_us) { (void)now_us; }
+static int  backlog_replay(int max_frames) { (void)max_frames; return 0; }
+
+#endif /* CAMERA_ENABLE */
 
 /* ---------------- 主流程 ---------------- */
 
@@ -873,6 +1143,28 @@ void app_main(void)
         ESP_LOGW(TAG, "摄像头初始化失败，脱机仅保留加速度上传");
     }
 #endif
+
+    /* 2.6) 断网补传用的 Flash 队列（计划书 4.2）。
+     * 必须在主循环之前挂载好 —— 否则断网时 backlog_ready() 是 false，
+     * 那段时间的帧只能丢，而这恰恰是这个功能要避免的情况。
+     * 失败只降级：其余功能（加速度/命令/求助/波形）完全不受影响。 */
+    esp_err_t bk_err = backlog_init();
+    if (bk_err != ESP_OK) {
+        /* ESP_ERR_NOT_SUPPORTED = 编译时被 BACKLOG_ENABLE 关掉了（不是故障）；
+         * 其它错误码 = 分区挂载真的失败了。把错误码原样打出来，
+         * 免得"故意关掉"和"坏掉了"在日志里长得一样。 */
+        ESP_LOGW(TAG, "断网缓存未启用（%s）：断网期间的帧会被丢弃，其余功能不受影响",
+                 esp_err_to_name(bk_err));
+    } else {
+        ESP_LOGI(TAG, "断网补传已就绪：分区 %s，当前队列 %d 帧，离线抓帧间隔 %d ms",
+                 BACKLOG_PARTITION_LABEL, backlog_count(), BACKLOG_OFFLINE_PERIOD_MS);
+        if (backlog_count() > 0) {
+            /* 上次开机断网时攒下的帧，这次开机联网后会被补传出去。
+             * 这属于**正常情况**，不是异常 —— 日志里说清楚，免得排查时误判。 */
+            ESP_LOGI(TAG, "  队列里有 %d 帧是上次开机遗留的，联网后会自动补传",
+                     backlog_count());
+        }
+    }
 
     /* 3) 连接 Wi-Fi */
     ESP_ERROR_CHECK(wifi_init_sta());
@@ -935,6 +1227,20 @@ void app_main(void)
         int64_t t0 = esp_timer_get_time();
 
         /*
+         * 0) 断网期间的抓帧缓存（计划书 4.2）。
+         *
+         * 刻意放在**所有上传逻辑之前**，也刻意**不挂在传感器读取之后** ——
+         * 抓帧缓存和"加速度计读到了没有"是两件不相干的事。
+         * 如果放在 qma7981_read 之后，传感器一旦读失败，那一轮的
+         * `continue` 会连带把抓帧也停掉：一个子系统的故障悄悄让
+         * 另一个子系统也不工作，而串口上只看得到「读取传感器失败」——
+         * 排查时根本想不到是它连累的。
+         */
+        if (!s_wifi_connected) {
+            backlog_capture_if_due(esp_timer_get_time());
+        }
+
+        /*
          * 0) 命令通道：按自己的节拍取指令。
          *
          * 刻意放在周期采集之前、且用独立的计时变量 —— 这样即使把
@@ -995,8 +1301,27 @@ void app_main(void)
                 }
             } else {
                 ESP_LOGW(TAG, "Wi-Fi 仍未就绪，跳过本次上传");
+                /*
+                 * 注意这里 `continue` 跳过的是**上传**，不是抓帧 ——
+                 * 抓帧缓存已经在循环开头做过了（见步骤 0）。
+                 * 断网期间照常抓帧存进 Flash 队列，等网络回来自动补传
+                 * （计划书 4.2「断网缓冲不是可选项」）。
+                 * 原来这里直接 continue 就真的什么都不做了，那段时间一片空白。
+                 */
                 continue;
             }
+        }
+
+        /*
+         * 联网了：先把 Flash 里攒下的旧帧补传出去（先进先出，每轮最多 1 帧）。
+         *
+         * 刻意排在周期上报之前 —— 补传的是**更早**的数据，
+         * 先送老的再送新的，服务端看到的时间序列才是顺着来的。
+         */
+        int replayed = backlog_replay(BACKLOG_REPLAY_PER_LOOP);
+        if (replayed > 0) {
+            ESP_LOGI(TAG, "本轮补传 %d 帧，队列还剩 %d 帧",
+                     replayed, backlog_count());
         }
 
         char ts_device[48];
@@ -1045,7 +1370,19 @@ void app_main(void)
                     make_device_timestamp(cap_ts, sizeof(cap_ts));
                     ESP_LOGI(TAG, "周期抓取一帧 %u bytes，上传中…",
                              (unsigned int)fb->len);
-                    upload_frame(fb->buf, fb->len, cap_ts, cap_ts, NULL);
+                    /*
+                     * 周期抓拍：不带 request_id、也不是补传。
+                     * source 明确写 "periodic"，不留给服务端按"有没有 request_id"去推断 ——
+                     * 推断虽然也能得出正确结果，但显式声明让"这一帧从哪来"
+                     * 在链路上就是可查的，而不是靠约定推出来的。
+                     */
+                    const frame_meta_t meta = {
+                        .request_id      = NULL,
+                        .source          = "periodic",
+                        .buffered_us     = -1,
+                        .backlog_dropped = -1,
+                    };
+                    upload_frame(fb->buf, fb->len, cap_ts, cap_ts, &meta);
                     esp_camera_fb_return(fb);
                 }
             }
