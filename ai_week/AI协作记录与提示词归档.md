@@ -806,7 +806,11 @@ except OSError as e:
 | 第 5 周 | 逐屏对账参考实现 + 最小可行范围 + `做，做完就上传github` | 见下方提交历史 | `firmware/main/wave.c`、`wave.h`、`qma7981.c`（I2C 互斥）、`main.c`、`app_config.h`、`server/server.py`、`server/selftest_wave.py`、`server/selftest_page.js`、`server/index.html`、`第五周-传感器示波器与姿态孪生.md` |
 | 第 2 周欠账补做 | `请继续执行任务`（AI 翻计划书原文，补「不是可选项」的断网缓冲） | `22e0566` | `firmware/main/backlog.c`、`backlog.h`（新）、`main.c`、`app_config.h`、`partitions.csv`、`CMakeLists.txt`、`server/server.py`、`server/nl_agent.py`、`server/selftest_backlog.py`（新）、`server/index.html`、`断网补传设计说明.md`（新） |
 
-**完整提交历史**（截至断网补传补做，共 33 笔，`git log --oneline --reverse` 可复核）：
+**完整提交历史**（`git log --oneline --reverse` 可复核；笔数用
+`git log --oneline | wc -l` 现查，不在这里写死 —— 写死了每次补记都会过期）：
+
+> 下面列到断网补传补做（`22e0566`）为止。之后的文档类提交未逐笔列出，
+> 因为它们不改功能，只改文字。
 
 ```
 fc48008 初始版本：ESP32-S3-EYE 加速度计采集 + Wi-Fi 上传（不含摄像头）
