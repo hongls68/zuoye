@@ -1,19 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 620" width="900" height="620" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
   <rect width="900" height="620" fill="#ffffff"/>
   <text x="30" y="36" font-size="19" font-weight="700" fill="#0f172a">载板（Carrier PCB）布局图 · 1:1</text>
-  <text x="30" y="57" font-size="12" fill="#64748b">74.0 × 54.0 mm　·　2 层板　·　1.6 mm 厚　·　**不重画主控**：核心板直接用现成模块，载板只做电源与扩展</text>
+  <text x="30" y="57" font-size="12" fill="#64748b">74.0 × 54.0 mm（派生）　·　2 层板　·　1.6 mm 厚（设计给定）　·　不重画主控：核心板直接用现成模块，载板只做电源与扩展</text>
 
   <!-- ============ 板框 ============ -->
   <g transform="translate(0,0)">
     <rect x="170" y="110" width="518" height="378" rx="10" fill="#f0fdf4" stroke="#166534" stroke-width="2.2"/>
-    <text x="182" y="130" font-size="11" fill="#166534">载板 FR-4 1.6t · 绿油 · 沉金</text>
+    <text x="182" y="130" font-size="11" fill="#166534">载板 FR-4 1.6t（设计给定）· 绿油 · 沉金</text>
 
     <!-- 四角安装孔 -->
     <g fill="#ffffff" stroke="#166534" stroke-width="1.5">
       <circle cx="200" cy="142" r="8"/><circle cx="658" cy="142" r="8"/>
       <circle cx="200" cy="456" r="8"/><circle cx="658" cy="456" r="8"/>
     </g>
-    <text x="212" y="146" font-size="9.5" fill="#166534">Ø3.2 ×4</text>
+    <text x="212" y="146" font-size="9.5" fill="#166534">Ø3.2 ×4 ← 与顶视图 Ø2.7 待统一</text>
 
     <!-- ===== 电源区 ===== -->
     <rect x="188" y="170" width="106" height="118" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.4" stroke-dasharray="5 3"/>
@@ -21,12 +21,13 @@
 
     <!-- USB-C 输入（左边缘） -->
     <rect x="170" y="196" width="26" height="52" rx="4" fill="#cbd5e1" stroke="#0f172a" stroke-width="1.4"/>
-    <text x="196" y="214" font-size="9.5" fill="#334155">USB-C</text>
-    <text x="196" y="228" font-size="9.5" fill="#334155">5V 输入</text>
+    <text x="172" y="213" font-size="8.5" fill="#334155">USB-C</text>
+    <text x="172" y="226" font-size="8.5" fill="#334155">5V 输入</text>
 
-    <!-- 电源开关 -->
+    <!-- 电源开关：标签分两行，否则会溢出到右边的排母区 -->
     <rect x="212" y="196" width="72" height="26" rx="4" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.4"/>
-    <text x="218" y="213" font-size="9.5" fill="#334155">电源开关 SS-12D00</text>
+    <text x="218" y="207" font-size="8.5" fill="#334155">电源开关</text>
+    <text x="218" y="218" font-size="8.5" fill="#334155">SS-12D00</text>
 
     <!-- 充电管理 -->
     <rect x="212" y="234" width="72" height="46" rx="4" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
@@ -35,11 +36,13 @@
 
     <!-- 电池接口 -->
     <rect x="212" y="290" width="72" height="30" rx="4" fill="#e2e8f0" stroke="#0f172a" stroke-width="1.4"/>
-    <text x="218" y="309" font-size="9.5" fill="#334155">JST-PH 2P 电池</text>
+    <text x="218" y="302" font-size="9" fill="#334155">JST-PH 2P</text>
+    <text x="218" y="314" font-size="9" fill="#334155">电池</text>
 
-    <!-- 反接保护 + 保险 -->
+    <!-- 反接保护 + 保险：同样分两行 -->
     <rect x="188" y="330" width="106" height="34" rx="4" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
-    <text x="196" y="351" font-size="9.5" fill="#334155">SS34 反接保护 + 自恢复保险 1A</text>
+    <text x="196" y="345" font-size="8.5" fill="#334155">SS34 反接保护</text>
+    <text x="196" y="357" font-size="8.5" fill="#334155">自恢复保险 1A</text>
 
     <!-- ===== 排母：对接核心板 ===== -->
     <rect x="320" y="180" width="330" height="26" rx="4" fill="#fef3c7" stroke="#b45309" stroke-width="1.6"/>
@@ -64,10 +67,12 @@
     <text x="692" y="228" font-size="9.5" fill="#1e3a8a">/ 执行器</text>
 
     <rect x="560" y="436" width="90" height="34" rx="4" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.4"/>
-    <text x="568" y="457" font-size="9.5" fill="#1e3a8a">I2C 扩展 JST 4P</text>
+    <text x="568" y="451" font-size="8.5" fill="#1e3a8a">I2C 扩展</text>
+    <text x="568" y="463" font-size="8.5" fill="#1e3a8a">JST 4P</text>
 
     <rect x="400" y="436" width="140" height="34" rx="4" fill="#fff" stroke="#0f172a" stroke-width="1.4"/>
-    <text x="408" y="457" font-size="9.5" fill="#334155">AO3400 低边开关 + 续流二极管</text>
+    <text x="408" y="451" font-size="8.5" fill="#334155">AO3400 低边开关</text>
+    <text x="408" y="463" font-size="8.5" fill="#334155">+ 续流二极管</text>
 
     <!-- 指示灯 -->
     <circle cx="330" cy="448" r="6" fill="#f87171" stroke="#0f172a" stroke-width="1.2"/>
@@ -79,10 +84,30 @@
   <g stroke="#0f172a" stroke-width="1" fill="#0f172a">
     <line x1="170" y1="86" x2="688" y2="86"/>
     <line x1="170" y1="80" x2="170" y2="92"/><line x1="688" y1="80" x2="688" y2="92"/>
-    <text x="429" y="78" font-size="11" text-anchor="middle">74.0</text>
+    <text x="429" y="78" font-size="11" text-anchor="middle">74.0（派生）</text>
     <line x1="142" y1="110" x2="142" y2="488"/>
     <line x1="136" y1="110" x2="148" y2="110"/><line x1="136" y1="488" x2="148" y2="488"/>
-    <text x="130" y="302" font-size="11" text-anchor="middle" transform="rotate(-90 130 302)">54.0</text>
+    <text x="130" y="302" font-size="11" text-anchor="middle" transform="rotate(-90 130 302)">54.0（派生）</text>
+  </g>
+
+  <!-- ============ 标注口径（★ / 派生 / 设计给定） ============ -->
+  <g transform="translate(760,100)">
+    <rect x="0" y="0" width="134" height="264" rx="8" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.2"/>
+    <text x="10" y="20" font-size="11.5" font-weight="700" fill="#b91c1c">★ = 示例值（待实测）</text>
+    <text x="10" y="38" font-size="10" fill="#7f1d1d">板卡外形 / 排针位置 /</text>
+    <text x="10" y="53" font-size="10" fill="#7f1d1d">孔径取自乐鑫尺寸图，</text>
+    <text x="10" y="68" font-size="10" fill="#7f1d1d">打样前必须卡尺复核。</text>
+    <text x="10" y="90" font-size="11.5" font-weight="700" fill="#1e3a8a">派生值</text>
+    <text x="10" y="107" font-size="10" fill="#1e3a8a">74.0 × 54.0 与排母</text>
+    <text x="10" y="122" font-size="10" fill="#1e3a8a">分区位置由板卡实测</text>
+    <text x="10" y="137" font-size="10" fill="#1e3a8a">外形 + 壁厚 + 间隙推</text>
+    <text x="10" y="152" font-size="10" fill="#1e3a8a">出，★ 一改要重算。</text>
+    <text x="10" y="174" font-size="11.5" font-weight="700" fill="#166534">设计给定</text>
+    <text x="10" y="191" font-size="10" fill="#166534">1.6t 板厚、线宽规则</text>
+    <text x="10" y="206" font-size="10" fill="#166534">可直接用。</text>
+    <text x="10" y="228" font-size="10" fill="#7f1d1d">本图是分区示意，不是</text>
+    <text x="10" y="243" font-size="10" fill="#7f1d1d">可打样坐标图；Gerber</text>
+    <text x="10" y="258" font-size="10" fill="#7f1d1d">需按实测值重画。</text>
   </g>
 
   <!-- ============ 设计说明 ============ -->
