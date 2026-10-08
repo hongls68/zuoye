@@ -53,7 +53,9 @@ ai_week/
 │   ├── partitions.csv         ← 自定义分区表（app 3 MB 容得下 esp32-camera + backlog 3 MB 存断网缓存）
 │   ├── sdkconfig.defaults     ← 板级配置：控制台走 COM4、8MB flash、Octal PSRAM
 │   └── main/
+│       ├── app_config.example.h ← 配置模板（**入库**；不含凭据，首次使用复制成 app_config.h）
 │       ├── app_config.h       ← ⚠️ 唯一需要你填写的文件（Wi-Fi / 服务器 / 设备编号 / 开关）
+│       │                         **已被 .gitignore 排除，不入库** —— 它含你的 Wi-Fi 密码
 │       ├── main.c             ← 主流程：断网缓存 → 命令轮询 → 采集 → 对时 → 上传/补传
 │       ├── qma7981.c          ← 板载加速度计驱动（含 I2C 互斥锁，供采样任务与主循环共用）
 │       ├── qma7981.h
@@ -79,6 +81,7 @@ ai_week/
 ├── 第三周-按键触发与物理反馈闭环.md  ← 第 3 周：三层状态设计、流程简图、引脚依据、走查清单、三课接口检查
 ├── 第四周-用自然语言查询与请求采集.md ← 第 4 周：两个角色、受限工具、结构化契约、防假成功三层防线、实测记录
 ├── 第五周-传感器示波器与姿态孪生.md   ← 第 5 周：姿态为何只需加速度计、批量上传 vs 流式、时间轴三档、几何孪生
+├── 第一周-传感采集与Web展示.md  ← 第 1 周：两个角色辨析、三方分工、单位与时间、**部署记录**（含未上 VPS 的如实说明）
 ├── 断网补传设计说明.md          ← 第 2 周欠账补做：补传帧的采集时刻在过去、三个时间口径、文件名即索引、板上验收步骤
 ├── 状态机与数据契约.md          ← 第 2 周交付物「首版状态图」的实现态：指令状态机 + 求助三层状态 + 三条证据 + 状态对照表
 ├── 硬件外壳与结构设计方案.md    ← 外壳 / 结构 / 载板 PCB 设计方案（含 BOM、装配顺序、验证清单）
@@ -153,7 +156,14 @@ python server.py
 
 ### 第 3 步：填写固件配置
 
-用记事本或 VS Code 打开 `firmware\main\app_config.h`，填三处：
+**先复制一份模板**（仓库里只有模板，真实配置不入库 —— 它含你的 Wi-Fi 密码）：
+
+```powershell
+cd D:\zuoye\ai_week\firmware\main
+copy app_config.example.h app_config.h
+```
+
+然后用记事本或 VS Code 打开 `firmware\main\app_config.h`，填三处：
 
 ```c
 #define WIFI_SSID       "你的WiFi名称"          // 必须是 2.4GHz，且和电脑同一个网络
@@ -161,6 +171,11 @@ python server.py
 #define SERVER_URL      "http://192.168.x.x:8000"  // 第1步抄下来的局域网地址
 #define DEVICE_ID       "s3eye-group07"         // 换成你的组号或学号
 ```
+
+> **`app_config.h` 已被 `.gitignore` 排除，不会进仓库。**
+> 这不是洁癖 —— 它曾经是被跟踪的，也就是说**真实 Wi-Fi 密码曾经躺在公开仓库里**。
+> 复盘见 [`项目复盘与踩坑记录.md`](项目复盘与踩坑记录.md) §16。
+> 另外 `QMA7981_CALIB_SCALE` 是**每块板子各不相同**的实测值，模板里是 1.0000，你换板子要重标。
 
 > **Wi-Fi 密码请自己在本机填写，不要发给任何人（包括 AI 助手）。**
 
@@ -1099,6 +1114,21 @@ curl --noproxy '*' http://127.0.0.1:11434/api/tags
 
 所以如果这条日志反复出现，问题在**链路**（见第 3 条「Wi-Fi 连上了，但上传失败」），
 不在补传逻辑 —— 补传只是忠实地不丢数据。查清了链路，队列会自己清空。
+
+### 24. 编译报 `app_config.h: No such file or directory`
+
+**这是预期的**，不是故障：真实配置含 Wi-Fi 密码，已被 `.gitignore` 排除，仓库里只放模板。
+
+```powershell
+cd D:\zuoye\ai_week\firmware\main
+copy app_config.example.h app_config.h     # 再打开填 Wi-Fi / SERVER_URL / DEVICE_ID
+```
+
+注意 `QMA7981_CALIB_SCALE` 在模板里是 `1.0000`，那是占位值 ——
+它**每块板子都不一样**，本块实测是 `0.8078`。不重标的话平放时合成加速度不会接近 1.000 g。
+
+> 顺带一句：这个文件曾经是被跟踪的，也就是说**真实 Wi-Fi 密码曾经躺在公开仓库里**。
+> 复盘见 `项目复盘与踩坑记录.md` §16。
 
 ---
 

@@ -2,6 +2,12 @@
 build*/
 managed_components/
 
+# ★ 固件真实配置（含 Wi-Fi 密码）——绝不入库。
+#   模板是 firmware/main/app_config.example.h（那个可以入库，不含凭据）。
+#   首次使用：cp app_config.example.h app_config.h 再填。
+#   注意写全路径，别写成 app_config.h —— 那会把模板也一起忽略掉。
+firmware/main/app_config.h
+
 # 运行时生成的数据与日志
 *.db
 *.log
