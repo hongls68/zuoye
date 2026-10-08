@@ -149,6 +149,10 @@ SWEEP_INTERVAL_S = 5               # 后台过期扫描周期（秒）
 #       原图只占存储，开发期留 7 天足够复现与演示。
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or 7)
 PURGE_INTERVAL_S = 300             # 后台清理扫描周期（秒）
+# ★ 一次清理里每处理多少行提交一次。为什么必须分批，见 purge_expired_frames 的注释：
+#   一次事务横跨几万行时，它同时占着 SQLite 写锁和 _db_lock，
+#   期间**整个服务端不可用**（2026-10-08 真机上被自己的清理堵了约 9 分半）。
+PURGE_BATCH = 200
 
 # ---- 第2周承诺的「断网 Flash 缓存」：补传帧怎么算 ----
 #
@@ -288,10 +292,23 @@ def now_iso() -> str:
     return datetime.now(TZ).isoformat(timespec="milliseconds")
 
 
+_dir_ready = False
+
+
 def get_db() -> sqlite3.Connection:
     # DATA_DIR 可能指向一个还不存在的目录（例如自测用 ./tmpdata），先补出来，
     # 否则 sqlite 直接抛 "unable to open database file"，排查起来很绕。
-    os.makedirs(DATA_DIR, exist_ok=True)
+    #
+    # ★ 只做一次，不要每次 get_db() 都做：os.makedirs() 内部会调
+    #   path.exists(head) 摸一次文件系统，而 get_db() 常常是在 _db_lock
+    #   里面被调用的 —— 那就等于「持着全局锁做文件系统操作」。
+    #   单次 stat 很快、不至于出事故，但这条不变量一旦松了口子，
+    #   下次有人往里塞个慢操作就没人拦得住了（2026-10-08 就是这么栽的）。
+    #   断言见 selftest_purge_lock.py。
+    global _dir_ready
+    if not _dir_ready:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        _dir_ready = True
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
@@ -384,6 +401,7 @@ def init_db() -> None:
                 boot_id       TEXT,
                 seq           INTEGER,
                 capture_ts    TEXT,
+                uploaded_at   TEXT,
                 frame_id      INTEGER,
                 frame_name    TEXT,
                 evidence_ok   INTEGER,
@@ -395,6 +413,39 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_commands_dev "
             "ON commands(device_id, id)"
         )
+        # 老库补列：CREATE TABLE IF NOT EXISTS 对已存在的表不加列。
+        #
+        # 【为什么必须补 uploaded_at 这一列】
+        #   时间线原来拿 capture_ts 填「观测入库」那一格 —— 那是**板钟**
+        #   （板子自称的采集时刻），而时间线上其它几格（created_at/dispatched_at/
+        #   ack_at/updated_at）全是**服务钟**。两种钟混排的后果不是"差几十毫秒"，
+        #   是**顺序本身会错**：2026-10-08 真机上板钟快约 170ms，于是时间线渲染成
+        #       UPLOADED  16:15:58.613  观测入库
+        #       COMPLETED 16:15:58.458  闭环结束
+        #   ——「先闭环结束、后观测入库」。这既撞第 3 周那条硬规矩
+        #   「服务端绝不采信板端时间」，也会让看页面的人以为系统出了 bug。
+        #   现在 uploaded_at 由**服务端**在 _link_command_frame 里打，
+        #   capture_ts 原样保留（它确实是"板子说这一帧什么时候采的"，
+        #   E2 校验还要用它），但**退出时间线**，改为单独字段带出并标注来源。
+        cmd_cols = {r[1] for r in conn.execute("PRAGMA table_info(commands)")}
+        for col, decl in (("uploaded_at", "TEXT"),):
+            if col not in cmd_cols:
+                conn.execute(f"ALTER TABLE commands ADD COLUMN {col} {decl}")
+        # 补历史数据：新列刚加上时全是 NULL，老记录的时间线会缺一格。
+        # ★ 这个补法是**有依据的、不是猜的**：凡是 frame_id 非空的行，说明确实
+        #   关联到了一帧观测，而 _link_command_frame 里 updated_at 与 uploaded_at
+        #   是**同一个 ts** —— 所以 updated_at 就是那一刻的服务端入库时刻。
+        #   反过来说：frame_id 为空的行（EXPIRED/TIMEOUT）绝不补，
+        #   它们的 updated_at 是超时时刻，不是入库时刻，填进去就是编造。
+        # ★ 幂等：补过之后 uploaded_at 非空，条件不再命中。
+        n_back = conn.execute(
+            "UPDATE commands SET uploaded_at = updated_at "
+            "WHERE uploaded_at IS NULL AND frame_id IS NOT NULL"
+        ).rowcount
+        if n_back:
+            print("[%s] 补历史：%d 条指令的 uploaded_at 由 updated_at 回填"
+                  "（frame_id 非空 = 确实关联过观测）" % (now_iso(), n_back),
+                  flush=True)
 
         # 第3周：按键求助事件。
         #
@@ -610,12 +661,20 @@ def parse_iso(iso: str):
 
 
 def command_timeline(row: sqlite3.Row) -> list:
-    """把一行指令摊成「状态时间线」，页面据此显示卡在哪一步。"""
+    """把一行指令摊成「状态时间线」，页面据此显示卡在哪一步。
+
+    ★ 时间线上**每一格都必须是服务钟**，否则排序没有意义。
+      created_at / dispatched_at / ack_at / uploaded_at / updated_at 全是服务端
+      自己打的时刻；板端自称的 capture_ts **刻意不进来**（见 command_to_dict 里
+      的 capture_ts_note）。2026-10-08 真机上它曾经进来过，结果板钟快约 170ms，
+      时间线渲染成「UPLOADED 16:15:58.613 → COMPLETED 16:15:58.458」，
+      看着像"先闭环、后入库"。
+    """
     marks = (
         ("created_at",    ST_PENDING,   "网页下发指令"),
         ("dispatched_at", ST_RECEIVED,  "设备取走并回执"),
         ("ack_at",        ST_EXECUTING, "设备开始采集"),
-        ("capture_ts",    ST_UPLOADED,  "观测入库"),
+        ("uploaded_at",   ST_UPLOADED,  "观测入库"),
     )
     line = []
     for col, state, note in marks:
@@ -637,6 +696,13 @@ def command_to_dict(row: sqlite3.Row) -> dict:
     # 绝不能回落到 latest.jpg —— 那正是本课题眼要排除的"旧值冒充"。
     d["has_frame"] = bool(row["frame_name"]) and row["state"] == ST_COMPLETED
     d["timeline"] = command_timeline(row)
+    # ★ 板钟单独带出来，并**明确标注它是什么钟**。
+    #   capture_ts 是"板子说这一帧什么时候采的"，跟 timeline 里那串服务端时刻
+    #   不是同一种钟，两者**不能混在一起排序**：2026-10-08 真机上板钟快约 170ms，
+    #   混排会让页面显示"先闭环结束、后观测入库"。
+    #   它仍然有用（E2 时序校验就靠它），所以不删，只是退出时间线。
+    d["capture_ts_note"] = ("板端时钟：设备自称的采集时刻，仅作参考与 E2 校验；"
+                            "时间线排序与状态判定一律用服务端时刻")
     return d
 
 
@@ -1293,6 +1359,13 @@ class Handler(BaseHTTPRequestHandler):
 
         返回校验结论，随 /api/frame 的响应一起回给开发板 ——
         这样串口日志里能直接看到「这次到底算不算成功、不成功是差哪条证据」。
+
+        ★ 这里同时落两个时刻，它们**来源不同、谁也替不了谁**：
+            capture_ts  = 板子自称的采集时刻（板钟）。E2 校验用它，展示用，
+                          但**服务端绝不拿它做排序或判定**（第 3 周硬规矩）。
+            uploaded_at = 服务端收到并入库的时刻（服务钟）。时间线用它。
+          混用会让时间轴出现「先 COMPLETED、后 UPLOADED」的假矛盾 ——
+          2026-10-08 真机上板钟快约 170ms，就这么撞出来了。
         """
         ts = now_iso()
         with _db_lock:
@@ -1311,10 +1384,10 @@ class Handler(BaseHTTPRequestHandler):
                 new_state = ST_COMPLETED if ok else ST_FAILED
                 conn.execute(
                     "UPDATE commands SET state=?, frame_id=?, frame_name=?, "
-                    "capture_ts=?, evidence_ok=?, fail_reason=?, updated_at=? "
-                    "WHERE id=?",
+                    "capture_ts=?, uploaded_at=?, evidence_ok=?, fail_reason=?, "
+                    "updated_at=? WHERE id=?",
                     (new_state, frame_id, frame["filename"],
-                     frame["capture_ts"] or ts, 1 if ok else 0,
+                     frame["capture_ts"] or ts, ts, 1 if ok else 0,
                      None if ok else reason, ts, cmd["id"]),
                 )
                 conn.commit()
@@ -2376,22 +2449,46 @@ def save_frame(data: bytes, ts: str) -> str:
     return fname
 
 
-def purge_expired_frames(conn) -> int:
+def purge_expired_frames() -> int:
     """按配额清理过期原图：删文件、置 purged_at，**元数据与哈希原样保留**。
 
     对应计划书 4.5「元数据永久留、原图按天清」：
     清完之后 /api/frames 仍能列出这一条（标成已清理），sha256 永远在，
     因此仍然能证明「当时的图是什么内容」——只是不再占存储。
+
+    ★★ 这个函数**自己管理加锁范围，调用方不许再拿 _db_lock 包住它**。
+       2026-10-08 真机踩到的坑：它原来收一个 conn、被 frame_purger 用
+       `with _db_lock:` 整个包住，一次要处理 35125 行（积压 17 天的帧），
+       循环里既有 os.remove() 又有每行一条 UPDATE，而 commit 只在最后做一次。
+       结果是：**整个服务端被自己的清理线程独占约 9 分半** ——
+       所有 HTTP 线程都停在 `with _db_lock` 那一行，开发板每一条上报都在
+       8 秒后超时（串口上表现为 esp-tls: select() timeout），
+       排查时看着像「板子连不上服务器」，其实跟板子、Wi-Fi、防火墙都无关。
+       现在拆成三段：① 短锁取名单 → ② **无锁**删文件 → ③ 短锁分批打标记。
+
+    ★ 顺序是「先删文件、后打标记」，不是反过来：
+       文件系统操作**不可回滚**，数据库可以。反过来写（先打标记再删文件），
+       一旦删失败就永远不会重试，磁盘只会一直涨；现在这样最坏情况只是
+       多扫一轮（文件已不在 → exists() 为假 → 直接打标记），最终一致。
+       代价是「被中断时会重扫」，所以更要分批 —— 分批把重扫的规模也压小了。
     """
     cutoff = (datetime.now(TZ) - timedelta(days=RETENTION_DAYS)).isoformat()
-    rows = conn.execute(
-        "SELECT id, filename FROM frames "
-        "WHERE purged_at IS NULL AND ts_server < ?", (cutoff,)
-    ).fetchall()
+
+    with _db_lock:                                   # ① 短锁：只取名单，不做事
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT id, filename FROM frames "
+                "WHERE purged_at IS NULL AND ts_server < ?", (cutoff,)
+            ).fetchall()
+        finally:
+            conn.close()
+
     n = 0
+    pending = []                                     # 文件已处理、待打标记的 id
     for row in rows:
         path = guard_snapshot_path(row["filename"])
-        if path and os.path.exists(path):
+        if path and os.path.exists(path):            # ② 无锁：文件系统操作
             try:
                 os.remove(path)
             except OSError as e:
@@ -2401,25 +2498,45 @@ def purge_expired_frames(conn) -> int:
                     print("[%s] 清理原图失败，下轮重试: %s (%s)"
                           % (now_iso(), row["filename"], e), flush=True)
                     continue
-        conn.execute("UPDATE frames SET purged_at = ? WHERE id = ?",
-                     (now_iso(), row["id"]))
-        n += 1
-    if n:
-        conn.commit()
+        pending.append(row["id"])
+        if len(pending) >= PURGE_BATCH:
+            n += _mark_purged(pending)               # ③ 短锁：分批打标记
+            pending = []
+    if pending:
+        n += _mark_purged(pending)
     return n
 
 
+def _mark_purged(ids: list) -> int:
+    """把一批 frame id 标记成已清理。
+
+    单独一个函数、单独一次提交：让「持锁时间」和「事务规模」都由 PURGE_BATCH
+    决定，而不是由「这一轮积压了多少」决定。
+    """
+    ts = now_iso()
+    with _db_lock:
+        conn = get_db()
+        try:
+            conn.executemany("UPDATE frames SET purged_at = ? WHERE id = ?",
+                             [(ts, i) for i in ids])
+            conn.commit()
+        finally:
+            conn.close()
+    return len(ids)
+
+
 def frame_purger() -> None:
-    """后台配额清理线程：每 PURGE_INTERVAL_S 扫一次，把超期原图收走。"""
+    """后台配额清理线程：每 PURGE_INTERVAL_S 扫一次，把超期原图收走。
+
+    ★ 这里**刻意不持 _db_lock**：加锁范围由 purge_expired_frames 自己按
+      「短锁取名单 / 无锁删文件 / 短锁分批打标记」三段决定。
+      把整个调用包进锁里 = 让一次大清理独占整个服务端（2026-10-08 踩过，
+      约 9 分半，期间开发板每一条上报都超时）。
+    """
     while True:
         time.sleep(PURGE_INTERVAL_S)
         try:
-            with _db_lock:
-                conn = get_db()
-                try:
-                    n = purge_expired_frames(conn)
-                finally:
-                    conn.close()
+            n = purge_expired_frames()
             if n:
                 print("[%s] 配额清理：%d 张原图超期（>%d 天）已清，元数据与哈希保留"
                       % (now_iso(), n, RETENTION_DAYS), flush=True)
@@ -2477,21 +2594,64 @@ def command_sweeper() -> None:
             print("[%s] 后台扫描异常: %s" % (now_iso(), e), flush=True)
 
 
+# ---- 本机地址：印一个「开发板真的连得上」的 ----
+# ★ 别用 socket.gethostbyname(socket.gethostname())：本机装了 Clash（TUN 虚拟网卡）
+#   之后它返回 198.18.0.1 —— 那是代理的虚拟网卡，板子在局域网里根本连不到。
+#   2026-10-08 真机上就是照抄了这个地址，白排查了半天。
+# ★ 也别用「连 8.8.8.8 看走哪块网卡」：那正是 Clash 接管的路径，同样得到 198.18.0.1。
+#   要连**局域网**地址才问得对，可我们不知道该连哪个 ——
+#   所以干脆把所有本机地址列出来，按「像不像真实局域网」排序，取最好的那个。
+_VIRTUAL_PREFIXES = ("198.18.", "198.19.", "172.17.", "172.18.", "172.19.")
+
+
+def _ip_rank(a: str) -> int:
+    """数值越小越可能是"板子连得上的真实局域网地址"。"""
+    if a.startswith("127."):
+        return 9                      # 回环：板子永远连不到
+    if a.startswith("169.254."):
+        return 8                      # 链路本地
+    if a.startswith(_VIRTUAL_PREFIXES):
+        return 7                      # 代理 / 容器虚拟网卡
+    if a.startswith(("10.", "192.168.", "172.")):
+        return 0                      # 真实局域网优先
+    return 5
+
+
+def lan_ip_candidates() -> list:
+    """本机所有 IPv4 地址，按「越像真实局域网越靠前」排序。"""
+    addrs = []
+    try:
+        for r in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            a = r[4][0]
+            if a not in addrs:
+                addrs.append(a)
+    except OSError:
+        pass
+    return sorted(addrs, key=_ip_rank)
+
+
 def main() -> None:
     init_db()
     threading.Thread(target=command_sweeper, daemon=True).start()
     threading.Thread(target=frame_purger, daemon=True).start()
     threading.Thread(target=wave_purger, daemon=True).start()
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    try:
-        lan = socket.gethostbyname(socket.gethostname())
-    except OSError:
-        lan = "127.0.0.1"
+    cands = lan_ip_candidates()
+    real = [c for c in cands if _ip_rank(c) == 0]
     print("=" * 60, flush=True)
     print("传感器接收服务已启动", flush=True)
     print("  本机访问:  http://127.0.0.1:%d/" % PORT, flush=True)
-    print("  局域网访问: http://%s:%d/  ← 填到开发板固件里" % (lan, PORT),
-          flush=True)
+    if real:
+        print("  局域网访问: http://%s:%d/  ← 填到开发板固件里"
+              % (real[0], PORT), flush=True)
+        if len(real) > 1:
+            print("              本机有多个局域网地址（%s）—— 板子连不上就换一个"
+                  % "、".join(real[1:]), flush=True)
+    else:
+        print("  ★ 没找到像局域网的本机地址（候选：%s）"
+              % ("、".join(cands) if cands else "无"), flush=True)
+        print("    装了 Clash 等代理时，TUN 虚拟网卡的地址（198.18.x.x）"
+              "开发板是连不到的", flush=True)
     print("  指令通道:  POST /api/command | GET /api/command/poll"
           " | POST /api/command/ack | GET /api/command/status", flush=True)
     print("  按键求助:  POST /api/help(发起/取消) | GET /api/help/poll(板端轮询)"

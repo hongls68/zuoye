@@ -136,9 +136,11 @@ def main() -> int:
         sys.path.insert(0, HERE)
         os.environ["RETENTION_DAYS"] = "0"
         import server as mod
-        conn = mod.get_db()
+        # ★ purge_expired_frames 现在不收 conn、自己管加锁范围与分批提交
+        #   （原因见 server.py 里那段注释：一次大清理曾把整个服务端堵了约 9 分半）。
+        n = mod.purge_expired_frames()
+        conn = mod.get_db()      # 清理后再开连接读，确保读到的是提交后的状态
         try:
-            n = mod.purge_expired_frames(conn)
             left = conn.execute("SELECT COUNT(*) c FROM frames "
                                 "WHERE purged_at IS NULL").fetchone()["c"]
             total = conn.execute("SELECT COUNT(*) c FROM frames").fetchone()["c"]

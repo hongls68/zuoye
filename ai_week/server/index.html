@@ -312,7 +312,7 @@
   </section>
 
   <table>
-    <thead><tr><th>请求编号</th><th>状态</th><th>指令下发</th><th>采集时刻</th><th>开机标识 / 序号</th><th>图像</th></tr></thead>
+    <thead><tr><th>请求编号</th><th>状态</th><th>指令下发<br><span style="font-weight:400;color:var(--dim)">（服务钟）</span></th><th>板端采集时刻<br><span style="font-weight:400;color:var(--dim)">（板钟，只作参考）</span></th><th>开机标识 / 序号</th><th>图像</th></tr></thead>
     <tbody id="reqBody"><tr><td colspan="6" style="color:var(--dim)">还没有下发过指令</td></tr></tbody>
   </table>
 
@@ -644,7 +644,8 @@
     }).join('') || '<li class="dim">暂无进展</li>';
 
     setReqNote('指令下发 ' + cmd.created_at +
-               ' · 采集时刻 ' + (cmd.capture_ts || '--') +
+               ' · 板端采集时刻 ' + (cmd.capture_ts || '--') +
+               '（板子的钟，只作参考）' +
                ' · 有效期至 ' + cmd.expires_at +
                (cmd.evidence_ok === 0 ? ' · 证据校验未通过' : ''));
   }

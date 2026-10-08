@@ -17,12 +17,15 @@ selftest_command.py —— 第2周「远程采集指令」自测脚本
 这个问题在真机上很难反复复现（要拔电源、要卡时间点），
 所以先把状态机在本地可测服务上跑扎实，真机只用来做最后的验收。
 
-覆盖五个场景：
+覆盖六个场景：
     1) 正常闭环    下发 → 取走 → 回执 → 上报观测 → COMPLETED（三条证据齐全）
     2) 设备关机    指令停在 PENDING，TTL 到点转 EXPIRED，且不产生任何图像
     3) 重复点击    两次点击生成两个独立 request_id，各自独立追踪
     4) 旧值冒充    capture_ts 早于下发时刻 → E2 不通过 → FAILED（绝不置 COMPLETED）
     5) 重复上传    同一开机内 seq 不递增 → E3 不通过 → FAILED
+    6) 板钟偏快    ★ 板钟快 2 秒时，时间线仍必须按**服务钟**排序，
+                   不许把 capture_ts（板钟）混进来 —— 混了就会出现
+                   「先 COMPLETED、后 UPLOADED」这种看着像 bug 的顺序。
 """
 import json
 import os
@@ -103,9 +106,10 @@ def poll_command():
     return req("GET", "/api/command/poll?device_id=" + DEVICE)
 
 
-def ack_command(request_id: str, seq: int = None, state: str = None):
+def ack_command(request_id: str, seq: int = None, state: str = None,
+                boot_id: str = None):
     body = {"request_id": request_id, "device_id": DEVICE,
-            "device_ts": now_iso(), "boot_id": BOOT_ID,
+            "device_ts": now_iso(), "boot_id": boot_id or BOOT_ID,
             "seq": next_seq() if seq is None else seq}
     if state:
         body["state"] = state
@@ -172,6 +176,32 @@ def scene_1_happy_path():
     check("状态时间线至少 5 个节点",
           bool(cmd and len(cmd["timeline"]) >= 5),
           "timeline=%d 项" % (len(cmd["timeline"]) if cmd else 0))
+
+    # --- ★ 时间线必须全是「服务钟」，且时刻单调不减 ---
+    # 这一条防的是一个**不报错、只是顺序看着像 bug** 的缺陷：
+    # 时间线原来把 capture_ts（板钟）填进「观测入库」那一格，而其它几格是服务钟。
+    # 2026-10-08 真机上板钟快约 170ms，于是页面渲染成
+    #     UPLOADED  16:15:58.613
+    #     COMPLETED 16:15:58.458
+    # ——「先闭环结束、后观测入库」。它不违反任何断言，只是看着像系统坏了。
+    # 现在 UPLOADED 用服务端自己打的 uploaded_at，这一条就是它的守卫。
+    tl = (cmd or {}).get("timeline") or []
+    times = [t["at"] for t in tl]
+    check("时间线时刻单调不减（不存在「先完成后入库」）",
+          times == sorted(times), " → ".join(times))
+
+    up = [t for t in tl if t["state"] == "UPLOADED"]
+    check("时间线里的 UPLOADED 用的是服务端 uploaded_at",
+          bool(up) and up[0]["at"] == cmd.get("uploaded_at"),
+          "uploaded_at=%s capture_ts(板钟)=%s"
+          % (cmd.get("uploaded_at"), cmd.get("capture_ts")))
+
+    check("板钟单独带出、并标注了它是什么钟（capture_ts_note）",
+          bool(cmd.get("capture_ts_note")),
+          "capture_ts_note=%s" % (cmd.get("capture_ts_note") or "缺失"))
+    # 注：这里**不**断言 uploaded_at != capture_ts —— 本自测的"板钟"就是本机钟，
+    #     两者可能落在同一毫秒，那样断言会偶发假失败（比不做校验更糟）。
+    #     真正要防的"板钟混进时间线"由场景6 用一个**故意偏快的板钟**来钉。
     return rid
 
 
@@ -267,6 +297,62 @@ def scene_5_replay():
           cmd["state_label"] if cmd else "查不到")
 
 
+def scene_6_skewed_device_clock():
+    """★ 场景6：板钟故意偏快 —— 时间线不许被它带歪。
+
+    这一条防的是一个**不报错、只是页面顺序看着像 bug** 的缺陷：
+    时间线原来把 capture_ts（板端自称的采集时刻）填进「观测入库」那一格，
+    而其它几格都是服务端打的时刻。两种钟混排 → 顺序本身会错。
+
+    真机上撞到过：板钟快约 170ms，页面渲染成
+        UPLOADED  16:15:58.613  观测入库
+        COMPLETED 16:15:58.458  闭环结束
+    ——「先闭环结束、后观测入库」。
+
+    本场景把偏差放大到 2 秒，这样**如果代码退回用 capture_ts，时间线一定乱序**，
+    断言必然报出来。之所以要专门造这个偏差，是因为场景1 的"板钟"就是本机钟，
+    和服务器同源、可能落在同一毫秒，拿它测不出混钟。
+    """
+    print("\n[场景6] 板钟偏快 2 秒：时间线必须仍按服务钟排序")
+    # ★ 用**独立开机标识**，不共用前面场景的 BOOT_ID。
+    #   原因：场景5 为了让 E3 拦下重放，往本开机塞了一条 seq=100 的帧；
+    #   若场景6 共用这个 boot_id，它那条 seq 很小的观测会被 E3 判成"重放"而落 FAILED，
+    #   就测不到时间线了（测的就不是我以为的那个东西 —— 这个坑踩过）。
+    boot6 = BOOT_ID + "-skew"
+    st, r = create_command()
+    rid = r["command"]["request_id"]
+    poll_command()
+    ack_command(rid, boot_id=boot6)
+    time.sleep(0.05)
+
+    # 板子自称"我 2 秒后才拍下这一帧"——比服务端现在快 2 秒。
+    # E2 只拦"采集时刻早于下发时刻"（防旧图冒充），不拦未来时刻，
+    # 所以这条观测能正常入库 —— 正好用来验证时间线会不会被它带歪。
+    skewed = (datetime.now(TZ) + timedelta(seconds=2)).isoformat(
+        timespec="milliseconds")
+    st, r = post_frame(rid, skewed, boot_id=boot6)
+    ev = (r or {}).get("evidence") or {}
+    check("偏快的板钟不影响闭环完成（E2 只拦过去时刻）",
+          st == 201 and ev.get("ok") is True, str(ev.get("reason")))
+
+    cmd = status_of(rid)
+    tl = (cmd or {}).get("timeline") or []
+    times = [t["at"] for t in tl]
+    check("时间线仍单调不减（板钟没被混进来排序）",
+          times == sorted(times), " → ".join(times))
+
+    up = [t for t in tl if t["state"] == "UPLOADED"]
+    check("UPLOADED 用的是服务端 uploaded_at，不是那个偏快的 capture_ts",
+          bool(up) and up[0]["at"] == cmd.get("uploaded_at")
+          and up[0]["at"] != cmd.get("capture_ts"),
+          "uploaded_at=%s  capture_ts=%s" % (cmd.get("uploaded_at"), skewed))
+
+    check("服务端 uploaded_at 早于板端自称的 capture_ts（两种钟确实不同）",
+          bool(cmd.get("uploaded_at")) and cmd["uploaded_at"] < cmd["capture_ts"],
+          "uploaded_at=%s < capture_ts=%s"
+          % (cmd.get("uploaded_at"), cmd.get("capture_ts")))
+
+
 def main() -> int:
     print("=" * 64)
     print("第2周 远程采集指令 · 状态机自测")
@@ -280,7 +366,8 @@ def main() -> int:
     print("服务端在线: %s" % r.get("server_now"))
 
     for scene in (scene_1_happy_path, scene_2_device_off,
-                  scene_3_double_click, scene_4_stale_capture, scene_5_replay):
+                  scene_3_double_click, scene_4_stale_capture, scene_5_replay,
+                  scene_6_skewed_device_clock):
         try:
             scene()
         except Exception as e:            # 单个场景异常不影响其余场景

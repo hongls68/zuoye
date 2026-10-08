@@ -307,6 +307,60 @@ static void http_drain_body(esp_http_client_handle_t client)
     }
 }
 
+/* 把错误码打成「名字(数值)」。
+ *
+ * 【为什么一定要带数值】
+ * esp_err_to_name() 只认识 esp_err.h 里登记过的码，其余一律返回 "ERROR"。
+ * 而**负的 errno**（socket 层错误）恰好全都没登记：
+ *     -104 = ECONNRESET（对端重置）、-110 = ETIMEDOUT（超时）、
+ *     -107 = ECONNREFUSED（拒绝）、-113 = EHOSTUNREACH、-114 = ENETUNREACH …
+ * 2026-10-08 真机排查时，串口从头到尾只有一句
+ *     E app: 上传失败: ERROR（检查服务器是否运行…）
+ * —— 等于自断线索。这跟上面 upload_reading 那段注释踩的是同一个坑
+ * （把真实原因统一压成 ESP_FAIL），只是深了一层：这次压它的是 IDF 自己。
+ * 带上数值，一眼就能分清「连不上 / 被重置 / 超时」。
+ *
+ * 静态缓冲：这些调用都在单一任务路径上，不会重入。
+ */
+static const char *err_str(esp_err_t e)
+{
+    static char buf[48];
+    snprintf(buf, sizeof(buf), "%s(%d)", esp_err_to_name(e), (int)e);
+    return buf;
+}
+
+/* 读响应头。★ 必须包这一层，不能直接写 `err = esp_http_client_fetch_headers(...)`。
+ *
+ * esp_http_client_fetch_headers() 的返回类型是 **int64_t，不是 esp_err_t**：
+ *     正数 = 响应体字节数（Content-Length）
+ *       0 = 响应里没有 Content-Length（或 chunked）
+ *     负数 = 出错（-1 = ESP_FAIL，-0x7007 = ESP_ERR_HTTP_EAGAIN）
+ *
+ * 所以 `err = esp_http_client_fetch_headers(client); if (err == ESP_OK) {...}`
+ * 是一句**永远为假**的判断 —— ESP_OK 就是 0，而成功时它返回的是正数。
+ * 后果不是"多打一行错日志"那么轻：
+ *
+ *   2026-10-08 真机：服务端每条都是 201、读数/波形/帧全都正常入库，
+ *   串口却从头到尾只刷「上传失败: ERROR(71)」「帧上传失败: ERROR(271)」
+ *   「取指令失败: ERROR(64)」「波形批次上传失败: ERROR(567)」——
+ *   那四个数根本不是错误码，是四种响应各自的 Content-Length
+ *   （/api/ingest=71、/api/frame=271、/api/command/poll=64、/api/waveform=567）。
+ *   更严重的是它把**整个远程指令闭环**悄悄废掉了：command_poll() 拿到正数
+ *   就走错误分支，body 一直是空的，解析不出指令 → 板子不回执、不抓图 →
+ *   服务端干等到 TIMEOUT。真机上 9 条指令没有一条走完过。
+ *   排查时看到的现象是"板子连不上服务器"，方向完全错了。
+ *
+ * 所以：只把**负数**当失败，其余一律算成功。
+ */
+static esp_err_t fetch_headers_ok(esp_http_client_handle_t client)
+{
+    int64_t n = esp_http_client_fetch_headers(client);
+    if (n < 0) {
+        return (esp_err_t)n;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t upload_reading(const qma7981_sample_t *s,
                                 const char *ts_device)
 {
@@ -356,7 +410,7 @@ static esp_err_t upload_reading(const qma7981_sample_t *s,
         if (written < 0) {
             err = ESP_FAIL;
         } else {
-            err = esp_http_client_fetch_headers(client);
+            err = fetch_headers_ok(client);
         }
     }
 
@@ -373,7 +427,7 @@ static esp_err_t upload_reading(const qma7981_sample_t *s,
         }
     } else {
         ESP_LOGE(TAG, "上传失败: %s（检查服务器是否运行、IP 是否填对、防火墙是否放行）",
-                 esp_err_to_name(err));
+                 err_str(err));
     }
 
     esp_http_client_close(client);
@@ -482,7 +536,7 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
         if (written < 0) {
             err = ESP_FAIL;
         } else {
-            err = esp_http_client_fetch_headers(client);
+            err = fetch_headers_ok(client);
         }
     }
 
@@ -511,7 +565,7 @@ static esp_err_t upload_frame(const uint8_t *buf, size_t len,
             err = ESP_FAIL;
         }
     } else {
-        ESP_LOGE(TAG, "帧上传失败: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "帧上传失败: %s", err_str(err));
     }
 
     esp_http_client_close(client);
@@ -607,7 +661,7 @@ static esp_err_t upload_wave_batch(const wave_batch_t *b)
         if (written < 0) {
             err = ESP_FAIL;
         } else {
-            err = esp_http_client_fetch_headers(client);
+            err = fetch_headers_ok(client);
         }
     }
 
@@ -640,7 +694,7 @@ static esp_err_t upload_wave_batch(const wave_batch_t *b)
         }
     } else {
         ESP_LOGE(TAG, "波形批次 #%lu 上传失败: %s",
-                 (unsigned long)b->batch_seq, esp_err_to_name(err));
+                 (unsigned long)b->batch_seq, err_str(err));
     }
 
     esp_http_client_close(client);
@@ -710,7 +764,7 @@ static bool command_poll(char *request_id, size_t len)
     int rd = 0;
     esp_err_t err = esp_http_client_open(client, 0);
     if (err == ESP_OK) {
-        err = esp_http_client_fetch_headers(client);
+        err = fetch_headers_ok(client);
     }
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
         while (rd < (int)sizeof(body) - 1) {
@@ -724,7 +778,7 @@ static bool command_poll(char *request_id, size_t len)
     } else if (err != ESP_OK) {
         /* 取指令失败不影响周期上报，下一轮再试即可，不必刷错误日志 */
         ESP_LOGW(TAG, "取指令失败: %s（不影响周期上报，下轮重试）",
-                 esp_err_to_name(err));
+                 err_str(err));
     }
     body[rd] = '\0';
     esp_http_client_close(client);
@@ -794,7 +848,7 @@ static esp_err_t command_ack(const char *request_id, const char *state,
     esp_err_t err = esp_http_client_open(client, strlen(payload));
     if (err == ESP_OK) {
         int written = esp_http_client_write(client, payload, strlen(payload));
-        err = (written < 0) ? ESP_FAIL : esp_http_client_fetch_headers(client);
+        err = (written < 0) ? ESP_FAIL : fetch_headers_ok(client);
     }
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
@@ -808,7 +862,7 @@ static esp_err_t command_ack(const char *request_id, const char *state,
             err = ESP_FAIL;
         }
     } else {
-        ESP_LOGE(TAG, "回执请求失败: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "回执请求失败: %s", err_str(err));
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
